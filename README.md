@@ -93,13 +93,16 @@ Server application which listens to events should
 activate a transport to send requests.
 
 ```python
-    router.activate()
+    server = AmqpTransport()
+
+    await router.activate(server)
 ```
 
 ## Markup an asynchronous distributed task
 
 Decorator `atasks.tasks.atask` is used to markup the asynchronous coroutine
-(or even synchronous returning `future` object).
+(or even synchronous returning `future` object) as an asynchronous distributed
+task.
 
 Note that the first call to the wrapper creates a default router. You should
 create your own Router (or ancestor) instance before the first call
@@ -107,13 +110,28 @@ to the wrapper.
 
 ```python
 @atask
-async def some task(a):
+async def some_task(a):
     ...
 ```
 
 ## Awaiting evaluation of the asynchronous distributed task
 
 Just await an asynchronous remote procedure exactly same as local coroutine.
+
+```python
+@atask
+async def some_task(a):
+    ret = await some_other_task(a)
+
+@atask
+async def some_other_task(a):
+    ...
+
+async def not_a_task_just_coro():
+    a = await some_task(42)
+    ...
+
+```
 
 ## Namespaces
 
@@ -124,7 +142,20 @@ pass an additional `namespace=...` parameter to:
 - atask decorator
 
 One namespace is completely separated from anoher. Every
-namespace uses it's own set of routers, transports andd
+namespace uses it's own set of router, transport, and codec.
+
+You can await task from one namespace to another.
+
+```python
+@atask(namespace='one')
+async def some_task():
+    await some_other_task()
+    ...
+
+@atask(namespace='other')
+async def some_other_task():
+    ....
+```
 
 ## Many thanx
 
