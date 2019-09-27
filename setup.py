@@ -26,7 +26,7 @@ from atasks import __version__ as version
 setup(
     name='atasks',
     version=version,
-    packages=['atasks', ],
+    packages=['atasks', 'atasks.transport', 'atasks.django', 'atasks.transport.backends'],
     platforms='any',
     install_requires=requirements,
     extras_require={
