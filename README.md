@@ -43,10 +43,11 @@ Note that the codec is installed into the system while construction.
 The transport determines a way to pass requests and return responses through the network.
 
 The `atasks.transport.base.LoopbackTransport` provided by the package passes
-all requests only inside a thread back. You can use it for the testing purposes.
+all requests back to the awaiter thread only. You can use it for the testing purposes
 
 The `atasks.transport.backends.amqp.AmqpTransport` provided by the package passes
-requests through the RabbitMQ or other AMQP broker.
+requests through the RabbitMQ or other AMQP broker to any worker started
+on the same or another host.
 
 Other transport kinds may be implemented later.
 
@@ -67,14 +68,14 @@ from atasks.transport.backends.amqp import AmqpTransport
 
 ### Router
 
-Router determines a way how the reference is look like, how it is awaited,
+Router determines a way how the reference looks like, how it is awaited,
 what data are passed over the network etc. Router is a core of the ATasks package.
 
 The `atasks.router.Router` is a router implementation.
 
 User can initialize the own router implementation.
 
-If you don't, you can use `get_router()` function to get a standard router.
+If you don't, you can use `get_router()` function to get a standard router instance.
 
 
 ```python
@@ -106,7 +107,7 @@ task.
 
 Note that the first call to the wrapper creates a default router. You should
 create your own Router (or ancestor) instance before the first call
-to the wrapper.
+to the wrapper if necessary.
 
 ```python
 @atask
@@ -135,16 +136,19 @@ async def not_a_task_just_coro():
 
 ## Namespaces
 
-All objects may be instantiated in separate namespaces. Just
+Objects may be instantiated in separate namespaces. Just
 pass an additional `namespace=...` parameter to:
 
 - constructor of codec, transport, or route object
 - atask decorator
+- `get_route`, `get_transport`, or `get_codec` function
 
 One namespace is completely separated from anoher. Every
 namespace uses it's own set of router, transport, and codec.
 
-You can await task from one namespace to another.
+The default namespace has a name `default`.
+
+You can await task from one namespace in another.
 
 ```python
 @atask(namespace='one')
