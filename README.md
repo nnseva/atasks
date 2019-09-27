@@ -17,6 +17,20 @@ pip install git+git://github.com/nnseva/atasks.git
 
 Before execution some number of core objects should be initialized.
 
+```python
+    from atasks.transport.backends.amqp import AMQPTransport
+    from atasks.router import get_router
+    from atasks.codecs import PickleCodec
+
+    PickleCodec()
+    transport = AMQPTransport()
+    await transport.connect()
+
+    if mode == 'server':
+        router = get_router()
+        await router.activate(transport)
+```
+
 ### Codec
 
 The codec determines a way to encode and decode objects passed through the network.
@@ -40,43 +54,48 @@ Note that the codec is installed into the system while construction.
 
 ### Transport
 
-The transport determines a way to pass requests and return responses through the network.
+Transport determines the method of sending requests and returning results
+from awaiter to the performing coroutine.
 
 The `atasks.transport.base.LoopbackTransport` provided by the package passes
-all requests back to the awaiter thread only. You can use it for the testing purposes
+all requests back to the awaiter thread only. You can use it for the testing purposes.
 
-The `atasks.transport.backends.amqp.AmqpTransport` provided by the package passes
-requests through the RabbitMQ or other AMQP broker to any worker started
+The `atasks.transport.backends.amqp.AMQPTransport` provided by the package passes
+requests through the RabbitMQ or other AMQP broker to any ATasks worker started
 on the same or another host.
+
+Any transport should be connected after creation. The `connect()` method is asynchronous.
+
+```python
+    from atasks.transport/base import LoopbackTransport
+    from atasks.transport.backends.amqp import AMQPTransport
+
+    ...
+    if transport == 'loopback':
+        LoopbackTransport()
+    elif transport == 'amqp':
+        AMQPTransport()
+    await transport.connect()
+```
 
 Other transport kinds may be implemented later.
 
-User can initialize the own transport implementation using `atasks.transport.base.Transport` as a base
+User can instantiate the own transport implementation using `atasks.transport.base.Transport` as a base
 class. Just replace all methods generating `NotImplementedError`. Note that
 most of methods are asynchronous.
 
-```python
-from atasks.transport/base import LoopbackTransport
-from atasks.transport.backends.amqp import AmqpTransport
-
-...
-    if 'transport' == 'loopback':
-        LoopbackTransport()
-    elif 'transport == 'amqp':
-        AmqpTransport()
-```
 
 ### Router
 
 Router determines a way how the reference looks like, how it is awaited,
 what data are passed over the network etc. Router is a core of the ATasks package.
 
-The `atasks.router.Router` is a router implementation.
+The `atasks.router.Router` is an only default router implementation.
 
-User can initialize the own router implementation.
+User can inherit and instantiate the own router implementation if necessary.
 
-If you don't, you can use `get_router()` function to get a standard router instance.
-
+As a rule, you don't need to do it. In this case, you can just
+use `get_router()` function to get a default router instance.
 
 ```python
 from atasks.router import get_router
@@ -94,8 +113,10 @@ Server application which listens to events should
 activate a transport to send requests.
 
 ```python
-    server = AmqpTransport()
+    server = AMQPTransport()
 
+    ...
+    router = get_router()
     await router.activate(server)
 ```
 
@@ -117,7 +138,7 @@ async def some_task(a):
 
 ## Awaiting evaluation of the asynchronous distributed task
 
-Just await an asynchronous remote procedure exactly same as local coroutine.
+Just await a decorated asynchronous remote procedure exactly same as any local coroutine.
 
 ```python
 @atask
@@ -161,7 +182,7 @@ async def some_other_task():
     ....
 ```
 
-## Many thanx
+## Inspiration
 
 The idea of ATasks has been inspired by `asyncio`, [Celery](https://docs.celeryproject.org/en/latest)
 and [aiotasks](https://github.com/cr0hn/aiotasks) packages.
@@ -210,7 +231,7 @@ coroutines in the same thread. It may be used for testing purposes.
 Other `Transport`s may allow remote awaits inside a process,
 or a host, or passed among a network.
 
-The `AmqpTransport` allows using RabbitMQ (or analogue) to
+The `AMQPTransport` allows using RabbitMQ (or analogue) to
 pass remote awaits among a network to any number
 of instances.
 
