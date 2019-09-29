@@ -25,10 +25,12 @@ class ModuleTest(TestCase):
         async def _test_():
             """Async test body"""
             t = LoopbackTransport()
+
             async def _callback(name, content):
                 self.assertIsInstance(content, bytes)
                 self.assertEqual(name, 'test')
                 return content
+
             await t.register_callback(_callback)
             result = await t.send_request('test', b'123')
             self.assertEqual(result, b'123')

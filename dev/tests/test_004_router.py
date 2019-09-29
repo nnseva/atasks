@@ -3,9 +3,9 @@ Router tests
 """
 import asyncio
 
-from atasks.codecs import PickleCodec, get_codec
-from atasks.router import Router, get_router
-from atasks.transport.base import LoopbackTransport, get_transport
+from atasks.codecs import PickleCodec
+from atasks.router import get_router
+from atasks.transport.base import LoopbackTransport
 
 from django.test import TestCase
 

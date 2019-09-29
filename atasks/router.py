@@ -1,5 +1,5 @@
 """
-AIO Steve Jobs Router
+ATasks Router
 """
 
 import logging
@@ -33,7 +33,7 @@ class TransportError(Exception):
     pass
 
 
-class Router(Manager):
+class Router(object):
     """
     Router is a core atasks class which registers asynchronous tasks,
     creates remote reference functions, routes reference calls to the remote coroutines,
@@ -48,9 +48,8 @@ class Router(Manager):
         :param namespace: name of the namespace which the router will use to send requests
         :type namespace: str
         """
-        super().__init__(namespace, unite=False)
         logger.info("Creating a router for %s", namespace)
-        namespaces.register(namespace, router=self)
+        namespaces.register(namespace, router=self, registry=Manager(namespace, unite=False))
         self.namespace = namespace
         self.server = None
 
@@ -143,7 +142,7 @@ class Router(Manager):
             raise NoCodecRegistered()
 
         argv, kwargs = await codec.decode(content)
-        item = self.get(name)
+        item = namespaces.get(self.namespace).registry.get(name)
         if not item:
             raise JobNotFound(name)
 
@@ -183,7 +182,7 @@ class Router(Manager):
         :returns: network reference stub to await atask remotely
         :rtype: awaitable
         """
-        self.register(name, coro=coro, options=options)
+        namespaces.get(self.namespace).registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
             result = await self.send_request(name, *argv, **kwargs)

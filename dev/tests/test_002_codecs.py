@@ -4,7 +4,6 @@ Codecs tests
 import asyncio
 
 from atasks.codecs import Codec, PickleCodec, get_codec
-from atasks.namespaces import namespaces
 
 from django.test import TestCase
 
@@ -26,7 +25,7 @@ class ModuleTest(TestCase):
         async def _test_():
             """Async test body"""
             c = PickleCodec()
-            check = ([1, 2], {'a':1, 'b':2})
+            check = ([1, 2], {'a': 1, 'b': 2})
             encoded = await c.encode(check)
             self.assertIsInstance(encoded, bytes)
             decoded = await c.decode(encoded)
