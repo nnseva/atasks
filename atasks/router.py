@@ -110,7 +110,7 @@ class Router(object):
         content = await codec.encode((argv, kwargs))
         logger.debug('Sending request %s using %s', name, client)
         response = await client.send_request(name, content)
-        logger.debug('Sending request %s response returned', name)
+        logger.debug('Response for %s returned', name)
         if not response:
             raise TransportError()
         success, result = await codec.decode(response)
@@ -182,13 +182,15 @@ class Router(object):
         :returns: network reference stub to await atask remotely
         :rtype: awaitable
         """
-        namespaces.get(self.namespace).registry.register(name, coro=coro, options=options)
+        namespace = self.namespace
+
+        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
-            result = await self.send_request(name, *argv, **kwargs)
+            result = await get_router(namespace).send_request(name, *argv, **kwargs)
             return result
 
-        aioref.__qualname__ = 'ref[%s/%s]' % (name, self.namespace)
+        aioref.__qualname__ = 'ref[%s/%s]' % (name, namespace)
         logger.info('Registered %s', aioref)
         return aioref
 

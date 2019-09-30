@@ -153,7 +153,7 @@ If your application should send requests only, no any
 other actions required on the initialization stage.
 
 Server application which listens to events should
-also activate a transport to send requests:
+also activate a transport to receive requests:
 
 ```python
     server = AMQPTransport()
@@ -247,49 +247,50 @@ and [aiotasks](https://github.com/cr0hn/aiotasks) packages.
 
 The main advantages of the ATasks comparing with Celery:
 - asynchronous task evaluation instead of synchronous tasks
-- free combining of task calls inside another task using await
-- easy awaiting a task and getting a result
+- free combining of `atask` awaits inside another `atask` using `await`
+- easy awaiting an `atask` and getting a result
 - parallelization using standard asynchronous syntax
-- no any restriction for recurrent awaits
+- no any restriction for recurrent `await`s
 
 The main advantages of the ATasks comparing with aiotasks:
-- easier getting a result (await instead of async with)
+- easier getting a result (`await` instead of `async with`)
 - full transparency - the only difference from usual
-  coroutine await is distributing tasks evaluation
+  coroutine `await` is distributing `atasks` evaluation
   among a network
 - actual development
 
-The main disadvantages with Celery and aiotasks:
+The main disadvantages comparing with Celery and aiotasks:
 - `delay()`, `send()`, `async_call()`, `s()` etc. syntax is not available,
   and will never be implemented
 
 Usual scenarios see in the [scenarios.py](dev/tests/scenarios.py) file.
 
-## Where the task is evaluated
+## Where the atask is evaluated
 
-After the task is started, it is running in one thread from the beginning
-to the end. Other tasks may share the same thread in an asynchronous manner.
+After the `atask` is started, it is running in one thread from the beginning
+to the end. Other `atask`s may share the same thread in an asynchronous manner.
 
-On the other side, another task called from the first one may be
-running on any ATasks worker, on the same as the first one, or another,
-depending on the decision taken on the transport layer.
+On the other side, another `atask` called from the first one may be
+running on any ATasks worker, on the same as the first one, or another
+worker and host, depending on the decision taken on the transport layer,
+and present ATask workers connected to the same transport layer.
 
-The point where the task is awaited is the only point of taking
-a decision, where the awaited task should be running. The transport layer
-takes  this decision.
+The point where the `atask` is `await`ed is the only point of taking
+a decision, where the `await`ed `atask` should run. The
+transport layer takes this decision.
 
-The ATasks application can issue remote awaits immediately after
-core objects initializing. The ATask application receives remote
-awaits after the `activate()` call of the `Router`.
+The ATasks application can issue remote `await`s immediately after
+transport `connect()`. The ATask application receives remote
+`await`s after the `activate()` call of the `Router`.
 
-The `LoopbackTransport` always passes all awaits immediately to
+The `LoopbackTransport` always passes all `await`s immediately to
 coroutines in the same thread. It may be used for testing purposes.
 
-Other `Transport`s may allow remote awaits inside a process,
+Other `Transport`s may allow remote `await`s inside a process,
 or a host, or passed among a network.
 
 The `AMQPTransport` allows using RabbitMQ (or analogue) to
-pass remote awaits among a network to any number
+pass remote `await`s among a network to any number
 of instances.
 
 ## How to track `atask`
