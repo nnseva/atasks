@@ -60,42 +60,14 @@ async def request_parallel():
 
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
-    from atasks.transport.base import LoopbackTransport
-    from atasks.transport.backends.amqp import AMQPTransport
-    from atasks.router import get_router
-    from atasks.codecs import PickleCodec
-    PickleCodec()
-    kw = {}
-    if options['transport'] in ('amqp',):
-        kw = {
-            'url': options['url']
-        }
-    transport = {
-        'loopback': LoopbackTransport,
-        'amqp': AMQPTransport
-    }[options['transport']](**kw)
-    await transport.connect()
-    router = get_router()
-    if options['mode'] in ('server', 'loopback'):
-        # checking activate/deactivate circle
-        await router.activate(transport)
-        await asyncio.sleep(1)
-        await router.deactivate()
-        await asyncio.sleep(1)
-        await router.activate(transport)
 
-    if options['mode'] == 'server':
-        logger.info("Listening for requests")
-        while 42:
-            await asyncio.sleep(1)
-        return
+    if options['mode'] in ('client', 'loopback'):
+        a = await task_one(42)
+        assert a == 42
 
-    a = await task_one(42)
-    assert a == 42
+        a = await task_three(24)
+        assert a == 24
 
-    a = await task_three(24)
-    assert a == 24
-
-    await request_sequence()
-    returns = await request_parallel()
-    assert returns == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+        await request_sequence()
+        returns = await request_parallel()
+        assert returns == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]

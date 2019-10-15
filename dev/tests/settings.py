@@ -32,7 +32,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 
-    'atasks.django',
+    'django_atasks',
     'tests',
 ]
 
@@ -128,6 +128,11 @@ LOGGING = {
             'propagate': True,
         },
         'atasks': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': True,
+        },
+        'django_atasks': {
             'handlers': ['console'],
             'level': 'ERROR',
             'propagate': True,

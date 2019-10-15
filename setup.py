@@ -26,7 +26,14 @@ from atasks import __version__ as version
 setup(
     name='atasks',
     version=version,
-    packages=['atasks', 'atasks.transport', 'atasks.django', 'atasks.transport.backends'],
+    packages=[
+        'atasks',
+        'atasks.transport',
+        'atasks.transport.backends',
+        'django_atasks',
+        'django_atasks.management',
+        'django_atasks.management.commands',
+    ],
     platforms='any',
     install_requires=requirements,
     extras_require={
@@ -34,6 +41,7 @@ setup(
             'django>=2.0',
         ],
         'test': [
+            'django>=2.0',
             'flake8',
             'wrapt',
             'tox',
@@ -43,7 +51,7 @@ setup(
     },
     include_package_data=True,
     data_files=[('.', ['requirements.txt'])],
-    license='BSD License',  # example license
+    license='LGPL',
     description='ATasks executes async Tasks in separate processes distributed among a network.',
     long_description=long_description,
     url='',

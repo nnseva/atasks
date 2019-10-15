@@ -147,7 +147,7 @@ from atasks.router import get_router
     router = get_router()
 ```
 
-#### Client and Server
+### Client and Server
 
 If your application should send requests only, no any
 other actions required on the initialization stage.
@@ -162,6 +162,8 @@ also activate a transport to receive requests:
     router = get_router()
     await router.activate(server)
 ```
+
+
 
 ## Markup an asynchronous distributed task
 
@@ -239,6 +241,45 @@ async def some_task():
 async def some_other_task():
     ....
 ```
+
+## Commands
+
+The package uses Django management subsystem to provide command-line interface.
+
+Django project using `django_atasks` application has the following command:
+
+```bash
+python manage.py run_atask file-or-module [options here]
+```
+
+The command runs any `file-or-module` referenced in the command line which contains
+`@atask` definitions and optional `aiomain` asynchronous coroutine. The
+optional `aiomain` coroutine is evaluated when the file is running.
+All options passed to the command are passed then to the `aiomain` keyword parameters.
+
+The `run_atask` management command initializes all necessary objects (as
+described above) to run module in three available modes: `server`, `client`,
+and `loopback`. The `loopback` mode allows to use the same process instance
+as server and client simultaneously.
+
+Note that if you use dedicated `server` process instance, you should not use
+`loopback` transport (which is not appropriate to reach the dedicated server
+in this case). Use `amqp` (or other interprocess transport) instead.
+
+The module naming is different slightly depending on what you use in command line,
+either file name, or module name. Use the same module naming starting server
+and client to avoid misnaming of `atask`s.
+
+You can start several modules simultaneously in one process instance
+enlisting them all in the command line.
+
+You can start several server process instances, the client will then request them
+in arbitrary order.
+
+Call the `help` command to see the command details.
+
+See `dev/tests/scenarios.py` file as an example of the file which can be called
+by the `run_atask` management command.
 
 ## Inspiration
 
