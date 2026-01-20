@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 async def task_one(a):
     """Example task"""
     logger.info("task_one starting: {}".format(a))
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.1)
     logger.info("task_one finished: {}".format(a))
     return a
 
@@ -24,7 +24,7 @@ async def task_one(a):
 async def task_two(a):
     """Another example task"""
     logger.info("task_two starting: {}".format(a))
-    await asyncio.sleep(2)
+    await asyncio.sleep(0.2)
     logger.info("task_two finished: {}".format(a))
     return a
 

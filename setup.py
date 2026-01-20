@@ -30,16 +30,10 @@ setup(
         'atasks',
         'atasks.transport',
         'atasks.transport.backends',
-        'django_atasks',
-        'django_atasks.management',
-        'django_atasks.management.commands',
     ],
     platforms='any',
     install_requires=requirements,
     extras_require={
-        'django': [
-            'django>=2.0',
-        ],
         'test': [
             'django>=2.0',
             'flake8',
@@ -60,8 +54,17 @@ setup(
     author_email='nnseva@gmail.com',
     classifiers=[
         'Development Status :: Beta',
-        'Framework :: Django',
         'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
+        'Programming Language :: Python :: 3.14',
+        'Programming Language :: Python :: 3.15',
+        'Development Status :: 4 - Beta',
+        'Intended Audience :: Developers',
+        'License :: OSI Approved :: GNU Library or Lesser General Public License (LGPL)',
+        'Topic :: Software Development :: Libraries',
         'Topic :: Development Tools'
     ],
 )

@@ -3,6 +3,7 @@ import logging
 import uuid
 
 import aio_pika
+
 from atasks.transport.base import Transport
 
 

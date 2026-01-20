@@ -1,13 +1,13 @@
 """
 Router tests
 """
+from unittest import TestCase
 
-from django.core.management import call_command
-from django.test import TestCase
+from atasks.run import main
 
 
 class ModuleTest(TestCase):
     """Module tests"""
     def test_run_atask(self):
         """Test scenarios"""
-        call_command('run_atask', 'dev.tests.scenarios', verbosity=3, mode='loopback')
+        main(['run.py', 'dev.tests.scenarios', '--verbosity=3', '--mode=loopback'])

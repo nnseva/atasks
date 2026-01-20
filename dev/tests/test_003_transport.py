@@ -1,11 +1,9 @@
 """
 Transport tests
 """
-import asyncio
+from unittest import IsolatedAsyncioTestCase as TestCase
 
 from atasks.transport.base import LoopbackTransport, Transport, get_transport
-
-from django.test import TestCase
 
 
 class ModuleTest(TestCase):
@@ -20,19 +18,15 @@ class ModuleTest(TestCase):
         t3 = Transport('the test')
         self.assertEqual(get_transport('the test'), t3)
 
-    def test_002_loopback_transport(self):
+    async def test_002_loopback_transport(self):
         """Test, whether the loopback transport works fine"""
-        async def _test_():
-            """Async test body"""
-            t = LoopbackTransport()
+        t = LoopbackTransport()
 
-            async def _callback(name, content):
-                self.assertIsInstance(content, bytes)
-                self.assertEqual(name, 'test')
-                return content
+        async def _callback(name, content):
+            self.assertIsInstance(content, bytes)
+            self.assertEqual(name, 'test')
+            return content
 
-            await t.register_callback(_callback)
-            result = await t.send_request('test', b'123')
-            self.assertEqual(result, b'123')
-
-        asyncio.get_event_loop().run_until_complete(_test_())
+        await t.register_callback(_callback)
+        result = await t.send_request('test', b'123')
+        self.assertEqual(result, b'123')

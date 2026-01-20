@@ -2,9 +2,9 @@
 Registry Manager tests
 """
 
-from atasks import registry
+from unittest import IsolatedAsyncioTestCase as TestCase
 
-from django.test import TestCase
+from atasks import registry
 
 
 class ModuleTest(TestCase):

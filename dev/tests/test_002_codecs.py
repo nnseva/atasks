@@ -1,11 +1,9 @@
 """
 Codecs tests
 """
-import asyncio
+from unittest import IsolatedAsyncioTestCase as TestCase
 
 from atasks.codecs import Codec, PickleCodec, get_codec
-
-from django.test import TestCase
 
 
 class ModuleTest(TestCase):
@@ -20,15 +18,11 @@ class ModuleTest(TestCase):
         c3 = Codec('the test')
         self.assertEqual(get_codec('the test'), c3)
 
-    def test_002_pickle_codec(self):
+    async def test_002_pickle_codec(self):
         """Test, whether the pickle codec works fine"""
-        async def _test_():
-            """Async test body"""
-            c = PickleCodec()
-            check = ([1, 2], {'a': 1, 'b': 2})
-            encoded = await c.encode(check)
-            self.assertIsInstance(encoded, bytes)
-            decoded = await c.decode(encoded)
-            self.assertEqual(check, decoded)
-
-        asyncio.get_event_loop().run_until_complete(_test_())
+        c = PickleCodec()
+        check = ([1, 2], {'a': 1, 'b': 2})
+        encoded = await c.encode(check)
+        self.assertIsInstance(encoded, bytes)
+        decoded = await c.decode(encoded)
+        self.assertEqual(check, decoded)
