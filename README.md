@@ -108,6 +108,25 @@ created instance should be awaited.
 
 Other transport kinds may be implemented later.
 
+`AMQPTransport` is built entirely on `aio_pika` (never on `pika` or another
+AMQP client) - the whole project is expected to standardize on this one
+AMQP client library, so `aio_pika` itself should never need to be imported
+directly from application code. Notable constructor options:
+
+- `url` - the AMQP broker URL (default `amqp://localhost/`).
+- `reconnect_interval` - seconds between reconnection attempts after the
+  broker connection is lost (default `5`), passed straight through to
+  `aio_pika.connect_robust`.
+- `client_properties` - optional dict merged into the AMQP connection
+  handshake (e.g. `{'connection_name': 'my-service'}`), useful for
+  identifying connections in the broker's management UI/API.
+- `prefix` - routing-key/queue/exchange namespacing prefix (default
+  `'atask'`) - give distinct services/environments distinct prefixes to keep
+  their RPC queues, task-queues, and broadcast exchanges from colliding.
+
+See "Request timeout and combining `@atask` with `backoff`" below for how
+`AMQPTransport` surfaces RPC timeouts and connection loss to the caller.
+
 User can inherit `atasks.transport.base.Transport` as a base class and create an own
 transport implementation. Just replace all methods generating `NotImplementedError`. Note that
 most of methods are asynchronous.
@@ -193,6 +212,9 @@ async def some_task(a):
     ...
 ```
 
+Both bare (`@atask`) and parameterized (`@atask(...)`) forms work, and so do
+the equivalent forms of `@atask_queue` and `@atask_broadcast` described below.
+
 ## Awaiting evaluation of the asynchronous distributed task
 
 The `atask` is awaited as a usual coroutine. You can use `await` keyword, or
@@ -212,6 +234,156 @@ async def not_a_task_just_coro():
     a = await some_task(42)
     ...
 ```
+
+## Request timeout and combining `@atask` with `backoff`
+
+`@atask` accepts an optional `timeout` (seconds). If the worker doesn't reply
+in time, the caller gets `atasks.transport.base.RequestTimeoutError` instead
+of waiting forever - see "When the worker evaluating `atask` is crashed"
+above for the full story, including connection-loss handling.
+
+Because `@atask` and `backoff.on_exception(...)` are both just async-function
+decorators, they compose in either order for either purpose. The recommended
+shape for a function that runs remotely applies independent retry policies on
+each side of the wire:
+
+```python
+import backoff
+from atasks.tasks import atask
+from atasks.transport.base import ConnectionLostError, RequestTimeoutError
+
+@backoff.on_exception(backoff.expo, (RequestTimeoutError, ConnectionLostError))  # retry the whole remote call - caller side
+@atask(timeout=30)
+@backoff.on_exception(backoff.expo, SomeTransientLocalError)  # retry the local execution - worker side
+async def some_processing_function(...):
+    ...
+    return result
+```
+
+- The **worker-side** `backoff.on_exception` retries the underlying function
+  locally before ever reporting failure back to the caller - transient
+  problems (a flaky downstream HTTP call, a momentary DB hiccup) never even
+  cross the wire.
+- The **caller-side** `backoff.on_exception` retries the entire remote call -
+  including a fresh `correlation_id` and reply-to round trip - when the
+  worker-side retries were exhausted, when the worker crashed outright
+  (`ConnectionLostError` while a request was in flight, or the same
+  `RequestTimeoutError` as a plain timeout, since - as noted above - a
+  crashed worker and a slow worker look the same from here).
+
+Decorator order matters: `@atask` must sit directly on the function that
+should be registered as (and invoked as) the remote task; a worker-side
+`backoff.on_exception` goes *below* it (applied to the plain local coroutine
+first), while a caller-side `backoff.on_exception` goes *above* it (applied
+to the network-calling stub `@atask` produces).
+
+## Task-queue (fire-and-forget, competing consumers)
+
+Use `@atask_queue` when the caller doesn't need (or want to wait for) a
+result, and exactly one instance among however many are currently listening
+should handle each call - the classic AMQP work-queue pattern. Good fit for
+specialized single-purpose consumer services, e.g. recalculating a rating
+when a contract closes, or generating a notification from a tracking event.
+
+```python
+from atasks.tasks import atask_queue
+
+@atask_queue
+async def recalculate_rating(contract_id):
+    ...
+```
+
+On the calling side, `await recalculate_rating(contract_id)` publishes the
+event and returns `None` immediately - it does not wait for, or receive, any
+result.
+
+On the consuming side, a process registers itself as one of the (possibly
+several) competing consumers explicitly, since - unlike the RPC pattern's
+single `router.activate(transport)` - there can be more than one independent
+task-queue (and/or broadcast topic, see below) active in the same process:
+
+```python
+from atasks.router import get_router
+
+router = get_router()
+await router.activate_queue('mypackage.recalculate_rating', transport)
+```
+
+Every instance which calls `activate_queue` with the same name binds to the
+*same* durable, named queue - so they compete, and every published event is
+delivered to exactly one of them, never to more than one, and never lost even
+if published before any consumer has started (the queue is declared durably
+by the publisher too).
+
+## Broadcast/subscribe (fire-and-forget, fan-out)
+
+Use `@atask_broadcast` when *every* currently-subscribed instance should
+receive and process its own independent copy of each event - the opposite of
+`@atask_queue`'s competing-consumers semantics. This is the pattern a fleet
+of WebSocket-gateway-style processes needs: every instance holds a different
+set of live client connections, and only that instance knows which of them
+are relevant to a given event, so every instance must see every event.
+
+```python
+from atasks.tasks import atask_broadcast
+
+@atask_broadcast
+async def relay_realtime_event(payload):
+    ...
+```
+
+```python
+from atasks.router import get_router
+
+router = get_router()
+await router.activate_broadcast('mypackage.relay_realtime_event', transport)
+```
+
+Topology: one shared (fanout) exchange per broadcast name, with one
+exclusive, auto-delete queue per subscribing instance bound to it - the same
+approach used by `channels_rabbitmq`. Each instance gets its own full copy of
+the stream while it's connected. Two direct consequences of the exclusive
+auto-delete queue:
+
+- a subscriber only receives events published *while it is actively
+  subscribed* - there is no replay of history from before it joined (unlike
+  the durable queue used by `@atask_queue`, which retains unconsumed events);
+- this topology has a known, accepted-for-MVP scaling limitation: every
+  subscribed instance receives *every* published event regardless of whether
+  it is relevant to any connection that instance actually holds, so
+  broker-side + deserialization + filtering load grows linearly with the
+  number of subscribed instances, independent of real per-event audience
+  size. Sharding by routing key/topic, a connection-presence registry for
+  addressed delivery, or broker-side filtering are the directions to
+  revisit this if it becomes a bottleneck - not something this package
+  solves today.
+
+## Idempotency - at-least-once delivery
+
+**All three patterns - `@atask` (RPC), `@atask_queue` (task-queue), and
+`@atask_broadcast` (broadcast) - are at-least-once, never exactly-once.** A
+function exposed through any of them can run more than once for what looks
+like a single logical event:
+
+- an RPC reply can be lost (network blip, broker restart) after the worker
+  already executed successfully, and a caller-side retry (manual, or via
+  `backoff.on_exception` as shown above) will then invoke the function again;
+- a task-queue or broadcast consumer can crash after processing a message but
+  before its ack reaches the broker, so the message (or, for
+  auto-acknowledged exclusive queues, a message the consumer never got to
+  acknowledge before disconnecting) is redelivered to another consumer (or to
+  the same one after it recovers);
+- a `RequestTimeoutError`-triggered caller-side retry can race a
+  slow-but-still-running worker, resulting in two executions of the same
+  logical call.
+
+**This package deliberately does not attempt to solve this for you** - de-
+duplication (idempotency keys, "processed event" tables, `INSERT ... ON
+CONFLICT DO NOTHING`-style upserts, etc.) is the caller's/handler's
+responsibility, exactly as it is for any other at-least-once delivery system
+(cloud pub/sub, SQS, periodic cron jobs that might overlap). Every function
+registered with `@atask`, `@atask_queue`, or `@atask_broadcast` should be
+written to be safely callable more than once with the same logical input.
 
 ## Namespaces
 
@@ -336,7 +508,13 @@ of instances.
 
 ## How to track `atask`
 
-???
+Every step of the RPC round trip is logged (`atasks.router` and
+`atasks.transport.backends.amqp` loggers) tagged with the request's
+`correlation_id`, so grepping a single correlation_id across client and
+worker logs reconstructs the whole round trip: request published, request
+received, response returning, response received (or the point at which it
+stopped - see below). There is no separate tracing/monitoring API beyond
+these logs today.
 
 ## When the `atask` is crashed
 
@@ -345,8 +523,49 @@ with exception. The exception should be serializable using codec.
 
 ## When the worker evaluating `atask` is crashed
 
-???
+Two distinct failure modes are handled, both without leaving the caller
+hanging forever:
+
+- **Request timeout.** Pass `timeout=<seconds>` to `@atask` (or per-decorator
+  via `options`) to bound how long the caller waits for a reply:
+
+  ```python
+  @atask(timeout=30)
+  async def some_task(a):
+      ...
+  ```
+
+  If no response arrives in time - because the worker crashed mid-task,
+  because it was never running in the first place, or because it is simply
+  slow - the caller gets `atasks.transport.base.RequestTimeoutError` (a
+  subclass of the builtin `TimeoutError`/`asyncio.TimeoutError`). **A crashed
+  worker and a slow worker are indistinguishable from the caller's point of
+  view** - AMQP gives no signal that a consumer died mid-task, so both
+  surface identically once the timeout elapses. Without a `timeout`, the
+  historical behaviour is preserved: the caller waits forever.
+
+- **Connection loss.** If the transport's own connection to the broker is
+  lost (broker restart, network partition, the whole worker process and its
+  connection disappearing, ...), every RPC request currently in flight on
+  that connection is failed immediately with
+  `atasks.transport.base.ConnectionLostError` (a subclass of the builtin
+  `ConnectionError`) - rather than waiting for the configured timeout, or
+  hanging past a later reconnect. `AMQPTransport` is built on
+  `aio_pika.connect_robust`, so the connection itself keeps retrying (with
+  `reconnect_interval`, default 5 seconds) in the background; this exception
+  exists purely so an in-flight caller finds out promptly instead of
+  discovering it much later.
+
+Both exceptions are ordinary exceptions raised out of the `await`ed call, so
+they compose naturally with `backoff.on_exception(...)` wrapped around the
+`@atask`-decorated call site - see "Request timeout and combining `@atask`
+with `backoff`" above.
 
 ## How to await `atask` in synchronous program
 
-???
+There isn't a dedicated synchronous API, and none is planned - `atask` is an
+`async def` coroutine like any other, so use it the same way you would use
+any other coroutine from synchronous code: `asyncio.run(some_task(...))` (or
+`loop.run_until_complete(...)` if you already manage your own loop). See
+`atasks/run.py` for exactly this pattern (`aiomain` is invoked via
+`loop.run_until_complete`).

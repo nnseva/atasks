@@ -41,6 +41,7 @@ setup(
             'tox',
             'isort',
             'pydocstyle',
+            'backoff',
         ],
     },
     include_package_data=True,

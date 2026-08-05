@@ -2,4 +2,4 @@
 ATasks package
 """
 
-__version__ = '0.0.2b1'
+__version__ = '0.1.0b1'

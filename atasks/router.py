@@ -82,7 +82,7 @@ class Router(object):
             await self.server.unregister_callback()
         self.server = None
 
-    async def send_request(self, name, *argv, **kwargs):
+    async def send_request(self, name, *argv, timeout=None, **kwargs):
         """
         Send a request.
 
@@ -95,8 +95,13 @@ class Router(object):
         :param name: name of the coroutine to be called
         :type name: str
         :param argv: arbitrary positional parameters
+        :param timeout: maximum number of seconds to wait for a response. ``None``
+                        (default) waits forever, preserving the historical behaviour.
+        :type timeout: float or None
         :param kwargs: arbitrary named parameters
         :returns: success flag and job awaiting result, or exception in case of the exception handled
+        :raises atasks.transport.base.RequestTimeoutError: if ``timeout`` elapses with no response
+        :raises atasks.transport.base.ConnectionLostError: if the broker connection is lost while waiting
         """
         logger.debug('Sending request %s %s %s', name, argv, kwargs)
         client = get_transport(self.namespace)
@@ -109,7 +114,7 @@ class Router(object):
 
         content = await codec.encode((argv, kwargs))
         logger.debug('Sending request %s using %s', name, client)
-        response = await client.send_request(name, content)
+        response = await client.send_request(name, content, timeout=timeout)
         logger.debug('Response for %s returned', name)
         if not response:
             raise TransportError()
@@ -118,6 +123,56 @@ class Router(object):
         if not success:
             raise result
         return result
+
+    async def send_event(self, name, *argv, **kwargs):
+        """
+        Publish a fire-and-forget task-queue event (see :meth:`register_queue_task`).
+
+        Exactly one competing consumer instance among all currently subscribed via
+        :meth:`activate_queue` will process it. No result is returned to the caller -
+        the call resolves as soon as the event is handed off to the transport.
+
+        :param name: name of the queue/task
+        :type name: str
+        :param argv: arbitrary positional parameters
+        :param kwargs: arbitrary named parameters
+        """
+        logger.debug('Sending event %s %s %s', name, argv, kwargs)
+        client = get_transport(self.namespace)
+        if not client:
+            raise NoClientTransportRegistered()
+
+        codec = get_codec(self.namespace)
+        if not codec:
+            raise NoCodecRegistered()
+
+        content = await codec.encode((argv, kwargs))
+        await client.publish_event(name, content)
+
+    async def send_broadcast(self, name, *argv, **kwargs):
+        """
+        Publish a fan-out event (see :meth:`register_broadcast_task`).
+
+        Every instance currently subscribed via :meth:`activate_broadcast` under the
+        same name receives and processes its own copy. No result is returned to the
+        caller - the call resolves as soon as the event is handed off to the transport.
+
+        :param name: name of the broadcast topic
+        :type name: str
+        :param argv: arbitrary positional parameters
+        :param kwargs: arbitrary named parameters
+        """
+        logger.debug('Sending broadcast %s %s %s', name, argv, kwargs)
+        client = get_transport(self.namespace)
+        if not client:
+            raise NoClientTransportRegistered()
+
+        codec = get_codec(self.namespace)
+        if not codec:
+            raise NoCodecRegistered()
+
+        content = await codec.encode((argv, kwargs))
+        await client.publish_broadcast(name, content)
 
     async def _on_request(self, name, content):
         """
@@ -156,6 +211,58 @@ class Router(object):
         logger.info('Request %s response returning', name)
         return response
 
+    async def _on_event(self, name, content):
+        """
+        Callback receiving a competing-consumer task-queue event.
+
+        Unlike :meth:`_on_request`, no response is encoded or returned -
+        the underlying transport already knows not to expect one.
+
+        :param name: name of the request
+        :type name: str
+        :param content: content of the request
+        :type content: bytes
+        """
+        logger.info('Queue event received %s', name)
+        codec = get_codec(self.namespace)
+        if not codec:
+            raise NoCodecRegistered()
+
+        argv, kwargs = await codec.decode(content)
+        item = namespaces.get(self.namespace).registry.get(name)
+        if not item:
+            raise JobNotFound(name)
+
+        success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        if not success:
+            logger.error('Queue task %s raised an exception: %r', name, result)
+
+    async def _on_broadcast(self, name, content):
+        """
+        Callback receiving a fan-out broadcast event.
+
+        Unlike :meth:`_on_request`, no response is encoded or returned -
+        the underlying transport already knows not to expect one.
+
+        :param name: name of the request
+        :type name: str
+        :param content: content of the request
+        :type content: bytes
+        """
+        logger.info('Broadcast event received %s', name)
+        codec = get_codec(self.namespace)
+        if not codec:
+            raise NoCodecRegistered()
+
+        argv, kwargs = await codec.decode(content)
+        item = namespaces.get(self.namespace).registry.get(name)
+        if not item:
+            raise JobNotFound(name)
+
+        success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        if not success:
+            logger.error('Broadcast task %s raised an exception: %r', name, result)
+
     async def _call_coro(self, coro, argv, kwargs, options):
         """
         Calls coroutine and returns success flag and result or exception
@@ -185,14 +292,142 @@ class Router(object):
         namespace = self.namespace
 
         namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+        default_timeout = options.get('timeout')
 
         async def aioref(*argv, **kwargs):
-            result = await get_router(namespace).send_request(name, *argv, **kwargs)
+            result = await get_router(namespace).send_request(name, *argv, timeout=default_timeout, **kwargs)
             return result
 
         aioref.__qualname__ = 'ref[%s/%s]' % (name, namespace)
         logger.info('Registered %s', aioref)
         return aioref
+
+    def register_queue_task(self, name, coro=None, options={}):
+        """
+        Register a fire-and-forget, competing-consumers task-queue task in the registry.
+
+        Returns a network reference stub used to publish the event remotely. Calling
+        the stub publishes the event and returns ``None`` immediately - it does not wait
+        for, or receive, a result.
+
+        :param name: name of the task-queue task
+        :type name: str
+        :param coro: coroutine to be registered as the consumer-side handler
+        :type coro: awaitable
+        :param options: registering additional options passed from the atask_queue decorator
+        :type options: dict
+        :returns: network reference stub used to publish the event remotely
+        :rtype: awaitable
+        """
+        namespace = self.namespace
+
+        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+
+        async def aioref(*argv, **kwargs):
+            await get_router(namespace).send_event(name, *argv, **kwargs)
+
+        aioref.__qualname__ = 'queue[%s/%s]' % (name, namespace)
+        logger.info('Registered queue task %s', aioref)
+        return aioref
+
+    def register_broadcast_task(self, name, coro=None, options={}):
+        """
+        Register a fire-and-forget, fan-out broadcast task in the registry.
+
+        Returns a network reference stub used to publish the event remotely. Calling
+        the stub publishes the event and returns ``None`` immediately - it does not wait
+        for, or receive, a result.
+
+        :param name: name of the broadcast topic
+        :type name: str
+        :param coro: coroutine to be registered as the subscriber-side handler
+        :type coro: awaitable
+        :param options: registering additional options passed from the atask_broadcast decorator
+        :type options: dict
+        :returns: network reference stub used to publish the event remotely
+        :rtype: awaitable
+        """
+        namespace = self.namespace
+
+        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+
+        async def aioref(*argv, **kwargs):
+            await get_router(namespace).send_broadcast(name, *argv, **kwargs)
+
+        aioref.__qualname__ = 'broadcast[%s/%s]' % (name, namespace)
+        logger.info('Registered broadcast task %s', aioref)
+        return aioref
+
+    async def activate_queue(self, name, transport=None):
+        """
+        Start consuming the named task-queue as one of possibly several competing
+        consumer instances.
+
+        :param name: name of the task-queue task, as passed to ``atask_queue``
+        :type name: str
+        :param transport: transport to consume from, defaults to this namespace's
+                          registered transport
+        :type transport: atasks.transport.base.Transport or None
+        """
+        transport = transport or get_transport(self.namespace)
+        if not transport:
+            raise NoClientTransportRegistered()
+
+        async def _callback(content):
+            await self._on_event(name, content)
+
+        await transport.register_event_callback(name, _callback)
+
+    async def deactivate_queue(self, name, transport=None):
+        """
+        Stop consuming the named task-queue previously activated with :meth:`activate_queue`.
+
+        :param name: name of the task-queue task
+        :type name: str
+        :param transport: transport to stop consuming from, defaults to this namespace's
+                          registered transport
+        :type transport: atasks.transport.base.Transport or None
+        """
+        transport = transport or get_transport(self.namespace)
+        if transport:
+            await transport.unregister_event_callback(name)
+
+    async def activate_broadcast(self, name, transport=None):
+        """
+        Subscribe to the named fan-out broadcast topic.
+
+        This instance receives its own independent copy of every event published
+        under ``name``, regardless of how many other instances are also subscribed.
+
+        :param name: name of the broadcast topic, as passed to ``atask_broadcast``
+        :type name: str
+        :param transport: transport to subscribe on, defaults to this namespace's
+                          registered transport
+        :type transport: atasks.transport.base.Transport or None
+        """
+        transport = transport or get_transport(self.namespace)
+        if not transport:
+            raise NoClientTransportRegistered()
+
+        async def _callback(content):
+            await self._on_broadcast(name, content)
+
+        await transport.register_broadcast_callback(name, _callback)
+
+    async def deactivate_broadcast(self, name, transport=None):
+        """
+        Unsubscribe from the named broadcast topic previously activated with
+        :meth:`activate_broadcast`.
+
+        :param name: name of the broadcast topic
+        :type name: str
+        :param transport: transport to unsubscribe from, defaults to this namespace's
+                          registered transport
+        :type transport: atasks.transport.base.Transport or None
+        """
+        transport = transport or get_transport(self.namespace)
+        if transport:
+            await transport.unregister_broadcast_callback(name)
 
 
 def get_router(namespace='default'):
