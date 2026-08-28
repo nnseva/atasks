@@ -46,12 +46,13 @@ setup(
     license='LGPL',
     description='ATasks executes async Tasks in separate processes distributed among a network.',
     long_description=long_description,
+    long_description_content_type='text/markdown',
     url='',
     zip_safe=False,
     author='Vsevolod Novikov',
     author_email='nnseva@gmail.com',
     classifiers=[
-        'Development Status :: Beta',
+        'Development Status :: 4 - Beta',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
@@ -63,6 +64,5 @@ setup(
         'Intended Audience :: Developers',
         'License :: OSI Approved :: GNU Library or Lesser General Public License (LGPL)',
         'Topic :: Software Development :: Libraries',
-        'Topic :: Development Tools'
     ],
 )
