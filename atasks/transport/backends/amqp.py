@@ -187,6 +187,7 @@ class AMQPTransport(Transport):
             await super().register_callback(callback)
             self._queue = await self._channel.declare_queue(
                 self.queue_name,
+                durable=True,
             )
             logger.info('Binding queue to %s', self.prefix + '.#')
             await self._queue.bind(self._request_exchange, self.prefix + '.#')
