@@ -416,23 +416,43 @@ async def some_other_task():
 
 ## Commands
 
-The package uses Django management subsystem to provide command-line interface.
+The package provides a command-line interface through the `atasks.run` module.
 
-Django project using `django_atasks` application has the following command:
+Run one or more files or Python modules containing `@atask` definitions and an
+optional asynchronous `aiomain` coroutine:
 
 ```bash
-python manage.py run_atask file-or-module [options here]
+python -m atasks.run file-or-module [file-or-module ...] [options]
 ```
 
-The command runs any `file-or-module` referenced in the command line which contains
-`@atask` definitions and optional `aiomain` asynchronous coroutine. The
-optional `aiomain` coroutine is evaluated when the file is running.
-All options passed to the command are passed then to the `aiomain` keyword parameters.
+For example, run the included scenario in loopback mode:
 
-The `run_atask` management command initializes all necessary objects (as
-described above) to run module in three available modes: `server`, `client`,
-and `loopback`. The `loopback` mode allows to use the same process instance
-as server and client simultaneously.
+```bash
+python -m atasks.run dev.tests.scenarios --mode loopback --verbosity 3
+```
+
+Each referenced file or module is loaded. If it defines `aiomain`, that
+coroutine is evaluated; parsed command-line options are passed to it as keyword
+arguments.
+
+The runner initializes the codec and transport, then runs in one of three
+modes: `server`, `client`, or `loopback`. The `loopback` mode allows the same
+process instance to act as both server and client.
+
+Available options are:
+
+- `-M`, `--mode` - execution mode: `client` (default), `server`, or `loopback`.
+- `-T`, `--transport` - transport: `loopback` (default) or `amqp`.
+- `-U`, `--url` - URL of the AMQP transport.
+- `-v`, `--verbosity` - logging verbosity from `0` to `4` (default `1`).
+- `-L`, `--loggers` - logger names to configure; defaults to `atasks`.
+- `-o`, `--option` - additional values made available to `aiomain` as `opt`.
+
+Run the module with `--help` to see the complete command-line reference:
+
+```bash
+python -m atasks.run --help
+```
 
 Note that if you use dedicated `server` process instance, you should not use
 `loopback` transport (which is not appropriate to reach the dedicated server
@@ -448,10 +468,8 @@ enlisting them all in the command line.
 You can start several server process instances, the client will then request them
 in arbitrary order.
 
-Call the `help` command to see the command details.
-
 See `dev/tests/scenarios.py` file as an example of the file which can be called
-by the `run_atask` management command.
+by the `atasks.run` module.
 
 ## Inspiration
 
