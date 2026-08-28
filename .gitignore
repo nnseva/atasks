@@ -1,7 +1,8 @@
 docs/_build
 build/
 dist/
-*.egg-info
+*.egg-info/
+.eggs/
 locale
 *.pyc
 *.pyo
