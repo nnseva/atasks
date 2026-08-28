@@ -13,7 +13,7 @@ from setuptools import find_packages, setup
 here = path.abspath(path.dirname(__file__))
 
 # Get the long description from the README file
-with open(path.join(here, 'README.rst'), encoding='utf-8') as f:
+with open(path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 # Get the requirements from the pip-requirements.txt file
@@ -35,7 +35,6 @@ setup(
     install_requires=requirements,
     extras_require={
         'test': [
-            'django>=2.0',
             'flake8',
             'wrapt',
             'tox',
