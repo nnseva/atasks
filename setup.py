@@ -20,12 +20,9 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
 with open(path.join(here, 'requirements.txt'), encoding='utf-8') as f:
     requirements = [l for l in f.read().split() if l]
 
-from atasks import __version__ as version
-
-
 setup(
     name='atasks',
-    version=version,
+    use_scm_version=True,
     packages=[
         'atasks',
         'atasks.transport',
@@ -43,6 +40,7 @@ setup(
             'backoff',
         ],
     },
+    setup_requires=['setuptools-scm>=8'],
     include_package_data=True,
     data_files=[('.', ['requirements.txt'])],
     license='LGPL',

@@ -2,4 +2,9 @@
 ATasks package
 """
 
-__version__ = '0.1.0b1'
+try:
+	from importlib.metadata import version
+
+	__version__ = version('atasks')
+except Exception:
+	__version__ = '0+unknown'

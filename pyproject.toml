@@ -1,0 +1,7 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+tag_regex = "^v?(?P<version>.*)$"
+fallback_version = "0.0.0"

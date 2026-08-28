@@ -8,6 +8,8 @@ locale
 *.sqlite*
 .svn/
 .tox/
+.venv/
+.vscode/
 .ropeproject
 polib.py
 reversion
