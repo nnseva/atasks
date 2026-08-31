@@ -531,8 +531,55 @@ Every step of the RPC round trip is logged (`atasks.router` and
 `correlation_id`, so grepping a single correlation_id across client and
 worker logs reconstructs the whole round trip: request published, request
 received, response returning, response received (or the point at which it
-stopped - see below). There is no separate tracing/monitoring API beyond
-these logs today.
+stopped - see below).
+
+On top of that, `atasks.trace` builds and carries, across however many `atask`
+hops and hosts a call chain crosses, the chain of `atask` calls (RPC/queue/
+broadcast) that led to whatever is currently running - and, unless disabled,
+the ordinary `await` frames in between. No call arguments are ever recorded,
+only call sites (file/line/function), atask/namespace/kind, a host
+identification, a per-call id and a timestamp.
+
+Every `atask` call chain starts at the root (the first `atask` called, however
+it was called), and is attached to an exception the first time it is caught,
+as `exception.__atask_trace__` - fetch it with `atasks.trace.get_trace(exc)`,
+or get it pre-rendered as readable text (atask hops picked out from the
+ordinary frames) with `atasks.trace.format_trace(exc)`:
+
+```python
+from atasks import trace
+
+try:
+    await some_task(...)
+except Exception as exc:
+    info = trace.get_trace(exc)      # AtaskTrace, or None
+    print(trace.format_trace(exc))   # human-readable, ready to log
+```
+
+- An RPC (`@atask`) failure is routed back to the caller exactly as before,
+  with the trace attached, and is **not** logged by the router itself - the
+  caller decides whether/how to log it.
+- An `atask_queue`/`atask_broadcast` failure has no caller to report back to,
+  so it terminates where it happened, logging the full collected trace instead
+  of a bare exception `repr()`.
+
+Host identification, the call-depth guard, and whether/what to filter out of
+the ordinary-`await` frames are all set on `Router`, and must be set *before*
+the first direct or indirect call to `get_router()` for the namespace - after
+that, `get_router()` returns the instance you constructed:
+
+```python
+from atasks.router import Router
+
+Router(
+    hostname='worker-fleet-2',       # default: socket.gethostname()
+    max_trace_depth=1000,            # atask hops only; guards against runaway recursion/cycles
+    trace_filter_modules=('atasks', 'backoff'),  # default: none filtered
+    collect_await_frames=True,       # False: trace holds only atask hops, no ordinary frames
+)
+```
+
+`run.py` exposes the host identification as `--hostname`/`-H`.
 
 ## When the `atask` is crashed
 

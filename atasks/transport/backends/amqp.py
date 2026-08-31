@@ -202,6 +202,7 @@ class AMQPTransport(Transport):
                 try:
                     response = await self.callback(name, request)
                 except Exception:
+                    # TODO: should the exception here be propagated back to the caller?
                     logger.exception('Unhandled error handling request for %s[%s]', name, correlation_id)
                     return
 
@@ -215,6 +216,7 @@ class AMQPTransport(Transport):
                         routing_key=info['reply_to'],
                     )
                 except Exception:
+                    # TODO: should the failure to publish the response be propagated?
                     logger.exception('Failed to publish response for %s[%s]', name, correlation_id)
 
             self._consumer = await self._queue.consume(_on_message)
