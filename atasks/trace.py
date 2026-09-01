@@ -13,11 +13,11 @@ implements.
 
 import functools
 import importlib.util
+import linecache
 import logging
 import os
 import sys
 import time
-import traceback
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 #: whatever code is currently running - empty for code not (yet) reached
 #: through any atask call.
 CURRENT = ContextVar('atasks_trace_current', default=())
+
+#: contextvar holding the live frame of the innermost ``Router._call_coro``
+#: currently on the stack (the frame of its ``await coro(...)`` line) - i.e.
+#: the boundary between "this atask's own body" and the atasks library/
+#: transport/event-loop plumbing that got it called. ``None`` outside of any
+#: atask handler (the root call). Set/reset by ``Router._call_coro`` itself;
+#: :func:`push_hop` and :func:`attach` use it to keep ordinary-``await``
+#: frames scoped to the current hop, instead of reaching back through the
+#: machinery of - or past - a previous hop's own execution.
+ENTRY_FRAME = ContextVar('atasks_trace_entry_frame', default=None)
 
 #: Marker used to render each ``kind`` of hop in :func:`format_trace`.
 _KIND_MARKERS = {
@@ -81,7 +91,15 @@ class AtaskHop:
     :ivar pid: process id the call was made from
     :ivar ts: unix timestamp the call was made at
     :ivar await_frames: ordinary ``await`` frames on the calling side leading
-        up to this call (empty if collection is disabled on the router)
+        up to this call (empty if collection is disabled on the router). For
+        every hop but the root one, these are scoped to the calling atask's
+        own execution (see :data:`ENTRY_FRAME`); for the root hop there is no
+        enclosing atask to scope them to, so they reach all the way to the
+        top of the stack - whatever that is (a web framework's request
+        handler, a plain script, a test runner, ...) - see ``is_root``.
+    :ivar is_root: ``True`` if this hop has no atask hop above it - i.e. it
+        was called directly, not from within another atask's handler. There
+        is exactly one such hop per trace, always at ``seq == 0``.
     """
 
     seq: int
@@ -96,6 +114,7 @@ class AtaskHop:
     pid: int
     ts: float
     await_frames: tuple = field(default_factory=tuple)
+    is_root: bool = False
 
 
 @dataclass(frozen=True)
@@ -176,22 +195,87 @@ def _is_filtered(filename, filter_modules):
     return False
 
 
-def _frame_infos(summaries, filter_modules):
+def _frame_info(frame, lineno, filter_modules):
     """
-    Convert a sequence of :class:`traceback.FrameSummary` to a filtered tuple of :class:`FrameInfo`.
+    Snapshot one live frame as a :class:`FrameInfo`, or ``None`` if it is filtered out.
 
-    :param summaries: frame summaries, e.g. from :func:`traceback.extract_stack`
-                      or :func:`traceback.extract_tb`
-    :type summaries: list
+    :param frame: live frame to snapshot
+    :type frame: types.FrameType
+    :param lineno: line number to record - ``frame.f_lineno`` for a stack frame,
+                   or a traceback's ``tb_lineno`` for one taken off a traceback
+                   (they can differ for the same frame as it keeps executing)
+    :type lineno: int
+    :param filter_modules: dotted module name prefixes to exclude
+    :type filter_modules: tuple
+    :rtype: FrameInfo or None
+    """
+    filename = frame.f_code.co_filename
+    if _is_filtered(filename, filter_modules):
+        return None
+    text = linecache.getline(filename, lineno, frame.f_globals)
+    return FrameInfo(file=filename, line=lineno, func=frame.f_code.co_name, text=text.strip() if text else '')
+
+
+def _walk_frames_until(frame, boundary, filter_modules):
+    """
+    Collect ordinary ``await`` frames from ``frame`` upward via ``f_back``, root-first.
+
+    Stops at (and excludes) ``boundary`` - the current hop's own entry point -
+    so a hop's frames never reach back into a previous hop's own execution, or
+    into the atasks library/transport/event-loop plumbing between the two.
+    Walks to the actual top of the stack if ``boundary`` is ``None`` (there is
+    no enclosing atask handler - this is the root call).
+
+    :param frame: innermost frame to start from (already excludes the call
+                  site itself, which is recorded separately)
+    :type frame: types.FrameType or None
+    :param boundary: frame to stop at, or ``None``
+    :type boundary: types.FrameType or None
     :param filter_modules: dotted module name prefixes to exclude
     :type filter_modules: tuple
     :rtype: tuple
     """
-    return tuple(
-        FrameInfo(file=s.filename, line=s.lineno, func=s.name, text=s.line or '')
-        for s in summaries
-        if not _is_filtered(s.filename, filter_modules)
-    )
+    collected = []
+    while frame is not None and frame is not boundary:
+        info = _frame_info(frame, frame.f_lineno, filter_modules)
+        if info is not None:
+            collected.append(info)
+        frame = frame.f_back
+    collected.reverse()
+    return tuple(collected)
+
+
+def _walk_traceback_after(tb, boundary, filter_modules):
+    """
+    Collect ordinary ``await`` frames along a traceback, root-first.
+
+    Skips ``boundary`` itself - the current hop's own entry point, i.e.
+    ``Router._call_coro``'s ``await coro(...)`` line, which every traceback
+    caught there starts at - and everything before it, so only frames that
+    are actually part of this hop's own execution are kept.
+
+    :param tb: traceback to walk, e.g. ``exception.__traceback__``
+    :type tb: types.TracebackType or None
+    :param boundary: frame to skip up to and including, or ``None`` to keep everything
+    :type boundary: types.FrameType or None
+    :param filter_modules: dotted module name prefixes to exclude
+    :type filter_modules: tuple
+    :rtype: tuple
+    """
+    collected = []
+    skipping = boundary is not None
+    while tb is not None:
+        frame = tb.tb_frame
+        if skipping:
+            if frame is boundary:
+                skipping = False
+            tb = tb.tb_next
+            continue
+        info = _frame_info(frame, tb.tb_lineno, filter_modules)
+        if info is not None:
+            collected.append(info)
+        tb = tb.tb_next
+    return tuple(collected)
 
 
 def current():
@@ -254,12 +338,19 @@ def push_hop(router, name, namespace, kind):
         )
 
     caller = sys._getframe(2)  # noqa - the call site above the aioref wrapper that called us
+    # None means there is no enclosing atask handler - this call was made
+    # directly, so it is the root of its whole chain (always exactly seq 0).
+    boundary = ENTRY_FRAME.get()
     await_frames = ()
     if router.collect_await_frames:
-        # Everything above the call site itself - the call site is already
-        # recorded below as caller_file/caller_line/caller_func.
-        summaries = traceback.extract_stack(caller.f_back)
-        await_frames = _frame_infos(summaries, router.trace_filter_modules)
+        # Everything above the call site itself (already recorded below as
+        # caller_file/caller_line/caller_func) up to - but not including -
+        # this hop's own entry point, so we never reach back into a previous
+        # hop's own execution or into the library/transport/event-loop
+        # plumbing in between. For the root hop (boundary is None) there is
+        # no such point to stop at, so this reaches all the way to the top of
+        # the stack - see AtaskHop.is_root.
+        await_frames = _walk_frames_until(caller.f_back, boundary, router.trace_filter_modules)
 
     hop = AtaskHop(
         seq=len(chain),
@@ -274,6 +365,7 @@ def push_hop(router, name, namespace, kind):
         pid=os.getpid(),
         ts=time.time(),
         await_frames=await_frames,
+        is_root=boundary is None,
     )
     return chain + (hop,)
 
@@ -297,8 +389,10 @@ def attach(ex, router):
 
     raise_frames = ()
     if router.collect_await_frames and ex.__traceback__ is not None:
-        summaries = traceback.extract_tb(ex.__traceback__)
-        raise_frames = _frame_infos(summaries, router.trace_filter_modules)
+        # ex.__traceback__ always starts at Router._call_coro's own
+        # `await coro(...)` line - skip it (and, defensively, anything
+        # before it) so only frames of this hop's own execution remain.
+        raise_frames = _walk_traceback_after(ex.__traceback__, ENTRY_FRAME.get(), router.trace_filter_modules)
 
     try:
         ex.__atask_trace__ = AtaskTrace(
@@ -369,6 +463,14 @@ def format_trace(ex):
         lines.append('  <no atask trace attached>')
     else:
         for hop in info.hops:
+            # await_frames lead up to this hop's own call site (the marker
+            # line right below) - rendered in that actual calling order, the
+            # same way a plain traceback puts the outer/earlier frame above
+            # the inner/later one it eventually calls into.
+            if hop.is_root and hop.await_frames:
+                lines.append('  -- entry point (no enclosing atask call) --')
+            for frame in hop.await_frames:
+                lines.append(_format_frame(frame, '      '))
             marker = _KIND_MARKERS.get(hop.kind, '»ATASK«')
             lines.append(_format_frame(
                 FrameInfo(hop.caller_file, hop.caller_line, hop.caller_func), '  %s ' % marker,
@@ -378,8 +480,6 @@ def format_trace(ex):
                     hop.task, hop.namespace, hop.kind, hop.call_id, hop.host, hop.pid, _format_ts(hop.ts),
                 )
             )
-            for frame in hop.await_frames:
-                lines.append(_format_frame(frame, '      '))
         for frame in info.raise_frames:
             lines.append(_format_frame(frame, '      '))
         lines.append('  (raised on host=%s pid=%s)' % (info.raise_host, info.raise_pid))

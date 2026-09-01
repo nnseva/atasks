@@ -4,6 +4,7 @@ ATasks Router
 
 import logging
 import socket
+import sys
 
 from atasks import trace
 from atasks.codecs import get_codec
@@ -341,12 +342,22 @@ class Router(object):
 
         On failure, attaches the atask call chain collected so far to the
         exception (see :func:`atasks.trace.attach`) before returning it.
+
+        Marks this frame's ``await coro(...)`` line as the current hop's entry
+        point for the duration of the call - the boundary
+        :func:`atasks.trace.push_hop`/:func:`atasks.trace.attach` use to keep
+        ordinary-``await`` frames scoped to this hop's own execution, instead
+        of reaching back through the atasks library/transport/event-loop
+        plumbing into a previous hop.
         """
+        token = trace.ENTRY_FRAME.set(sys._getframe())
         try:
             result = await coro(*argv, **kwargs)
         except Exception as ex:
             trace.attach(ex, self)
             return False, ex
+        finally:
+            trace.ENTRY_FRAME.reset(token)
 
         return True, result
 

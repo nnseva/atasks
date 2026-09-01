@@ -101,6 +101,9 @@ class LoopbackTraceTest(TestCase):
         # hop N's caller_func names the function that made call N - i.e. who called whom
         self.assertEqual(info.hops[1].caller_func, 'root')
         self.assertEqual(info.hops[2].caller_func, 'middle')
+        # only the very first hop (called directly, not from within another
+        # atask's handler) is the root - there is exactly one, always seq 0
+        self.assertEqual([hop.is_root for hop in info.hops], [True, False, False])
 
         # the code that actually raised is visible past the last atask hop
         self.assertTrue(any(f.func == '_raise_after_await' for f in info.raise_frames))
@@ -226,6 +229,114 @@ class LoopbackTraceTest(TestCase):
         all_frames = info.raise_frames + tuple(f for hop in info.hops for f in hop.await_frames)
         self.assertTrue(any(f.func == '_raise_after_await' for f in all_frames))
         self.assertFalse(any(os.path.abspath(f.file).startswith(ATASKS_PACKAGE_DIR) for f in all_frames))
+
+    async def test_008_await_frames_are_scoped_to_the_current_hop_only(self):
+        """await_frames/raise_frames must never reach into a previous hop's own
+        execution, or into the atasks library/transport plumbing between two
+        hops - even with no trace_filter_modules configured at all. Only the
+        ordinary awaits genuinely local to the current hop should appear."""
+        namespace = _fresh_namespace()
+        await self._wire(namespace)
+
+        @atask(namespace=namespace)
+        async def leaf(x):
+            return await _raise_after_await(x)
+
+        async def _local_helper(x):
+            """Ordinary (non-atask) helper sitting between middle's own body and its call to leaf."""
+            await asyncio.sleep(0)
+            return await leaf(x)
+
+        @atask(namespace=namespace)
+        async def middle(x):
+            return await _local_helper(x)
+
+        @atask(namespace=namespace)
+        async def root(x):
+            return await middle(x)
+
+        with self.assertRaises(ValueError) as ctx:
+            await root(1)
+
+        info = trace.get_trace(ctx.exception)
+        root_hop, middle_hop, leaf_hop = info.hops
+
+        # root's body is a single straight-through call - nothing ordinary
+        # happens before reaching middle, and root's own caller (the test
+        # method, asyncio/unittest internals above it) must not show up here.
+        self.assertEqual(middle_hop.await_frames, ())
+
+        # middle -> leaf: exactly middle's own call site into _local_helper -
+        # no more (not _local_helper itself, that's leaf_hop.caller_func;
+        # not any atasks-library plumbing; not root's frames either).
+        self.assertEqual([f.func for f in leaf_hop.await_frames], ['middle'])
+        self.assertEqual(leaf_hop.caller_func, '_local_helper')
+
+        # raise_frames: only leaf's and _raise_after_await's own frames - not
+        # _call_coro's "await coro(...)" line the traceback actually starts at.
+        self.assertEqual([f.func for f in info.raise_frames], ['leaf', '_raise_after_await'])
+
+        for f in leaf_hop.await_frames + info.raise_frames:
+            self.assertFalse(os.path.abspath(f.file).startswith(ATASKS_PACKAGE_DIR))
+
+    async def test_009_rendered_trace_follows_actual_call_chronology(self):
+        """format_trace must read top-to-bottom in the order things actually
+        happened: a hop's own await_frames (how execution got to its call
+        site) before that hop's marker line (the call site itself) - and, for
+        the root hop specifically, its leaked ambient stack (there being no
+        enclosing atask to bound it) called out and placed the same way."""
+        namespace = _fresh_namespace()
+        await self._wire(namespace)
+
+        @atask(namespace=namespace)
+        async def leaf(x):
+            return await _raise_after_await(x)
+
+        @atask(namespace=namespace)
+        async def root(x):
+            return await leaf(x)
+
+        async def _caller_wrapper(x):
+            """Ordinary (non-atask) helper making the actual root call site."""
+            return await root(x=x)
+
+        async def _caller_preamble():
+            """Ordinary (non-atask) helper one level above the root call site."""
+            await asyncio.sleep(0)
+            return await _caller_wrapper(1)
+
+        with self.assertRaises(ValueError) as ctx:
+            await _caller_preamble()
+
+        info = trace.get_trace(ctx.exception)
+        root_hop, leaf_hop = info.hops
+        self.assertTrue(root_hop.is_root)
+        self.assertEqual(root_hop.caller_func, '_caller_wrapper')
+        # _caller_preamble is one level *above* the actual call site
+        # (_caller_wrapper) - exactly the kind of frame that belongs in
+        # await_frames, not in caller_func itself.
+        self.assertTrue(any(f.func == '_caller_preamble' for f in root_hop.await_frames))
+
+        rendered = trace.format_trace(ctx.exception)
+        lines = rendered.splitlines()
+
+        def _find(needle, is_marker):
+            # a hop's marker line (its own call site) and a plain await_frame
+            # line could in general name the same function, so marker lines
+            # (carrying a »...« kind tag) and plain frame lines are told apart
+            # explicitly, not just matched by substring.
+            return next(i for i, line in enumerate(lines) if needle in line and ('»' in line) == is_marker)
+
+        entry_header = _find('entry point', False)
+        preamble_frame = _find('_caller_preamble', False)  # await_frame: one level above the root call site
+        root_marker = _find('in _caller_wrapper', True)  # root_hop's marker: the root call site itself
+        leaf_marker = _find('in root', True)  # leaf_hop's marker: called from root
+        raise_line = _find('_raise_after_await', False)
+
+        self.assertLess(entry_header, preamble_frame)
+        self.assertLess(preamble_frame, root_marker)
+        self.assertLess(root_marker, leaf_marker)
+        self.assertLess(leaf_marker, raise_line)
 
 
 class AMQPTraceTest(TestCase):
