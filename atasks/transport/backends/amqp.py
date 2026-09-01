@@ -81,12 +81,6 @@ class AMQPTransport(Transport):
         self.queue_name = queue
         self.reconnect_interval = reconnect_interval
         self.client_properties = client_properties
-        # Reserved per-pattern routing-key namespaces - see the class
-        # docstring for why these are what keep request/event/broadcast
-        # traffic apart even when their exchanges resolve to the same name.
-        self._request_routing_prefix = '%s.r.' % prefix
-        self._event_routing_prefix = '%s.e.' % prefix
-        self._broadcast_routing_prefix = '%s.b.' % prefix
         self._lock = asyncio.Lock()
         self._awaiting_requests = {}
         self._event_queues = {}
@@ -94,7 +88,25 @@ class AMQPTransport(Transport):
         self._broadcast_queues = {}
         self._broadcast_consumers = {}
 
+    # Reserved per-pattern routing-key namespaces - see the class
+    # docstring for why these are what keep request/event/broadcast
+    # traffic apart even when their exchanges resolve to the same name.
+    @property
+    def _request_routing_prefix(self):
+        return '%s.r.' % self.prefix
+
+    @property
+    def _event_routing_prefix(self):
+        return '%s.e.' % self.prefix
+
+    @property
+    def _broadcast_routing_prefix(self):
+        return '%s.b.' % self.prefix
+
+    # Functional method overrides
+
     async def unregister_callback(self):
+        """Override to implement callback unregistration."""
         await self._lock.acquire()
         try:
             if hasattr(self, '_queue') and hasattr(self, '_connection') and not self._connection.is_closed:
@@ -113,6 +125,7 @@ class AMQPTransport(Transport):
             self._lock.release()
 
     async def disconnect(self):
+        """Override to implement transport disconnection."""
         await self._lock.acquire()
         try:
             if not hasattr(self, '_connection'):
@@ -134,6 +147,7 @@ class AMQPTransport(Transport):
             self._lock.release()
 
     async def connect(self):
+        """Override to implement transport connection."""
         loop = asyncio.get_event_loop()
         await self._lock.acquire()
         try:
@@ -230,6 +244,24 @@ class AMQPTransport(Transport):
                     'AMQP connection lost while awaiting a response [%s]: %r' % (correlation_id, exc)
                 ))
 
+    @staticmethod
+    def _task_was_actually_cancelled():
+        """
+        True only if *this* task has a real, pending cancellation request
+        against it (``Task.cancelling()`` - Python 3.11+). aiormq can surface a
+        dead connection as a bare ``CancelledError`` from deep inside its own
+        reader/writer plumbing (it uses cancellation internally to unblock a
+        write that can never complete), which is indistinguishable, by
+        exception type alone, from this task genuinely being cancelled by
+        someone else - and a genuine cancellation must never be swallowed.
+        ``cancelling()`` only counts actual ``cancel()`` calls made against
+        this task, so if it is zero, nobody asked to cancel us and a
+        ``CancelledError`` reaching a caller of this can only be aiormq's
+        internal signal, safe to treat like any other publish failure.
+        """
+        task = asyncio.current_task()
+        return task is not None and bool(task.cancelling())
+
     async def _on_connection_closed(self, connection, exc=None):
         """
         Called by aio_pika whenever the underlying connection is lost - including
@@ -244,6 +276,7 @@ class AMQPTransport(Transport):
         logger.info('Reconnected transport %s', self)
 
     async def register_callback(self, callback):
+        """Override to implement callback registration."""
         await self._lock.acquire()
         try:
             await super().register_callback(callback)
@@ -292,9 +325,7 @@ class AMQPTransport(Transport):
         logger.info('Callback registered %s', callback)
 
     async def send_request(self, name, content, timeout=None):
-        """
-        Overriden from the base class
-        """
+        """Override to implement sending a request."""
         await self._lock.acquire()
         try:
             correlation_id = uuid.uuid4().hex  # probably not unique but with almost zero probability
@@ -311,19 +342,7 @@ class AMQPTransport(Transport):
                     routing_key=self._request_routing_prefix + name,
                 )
             except asyncio.CancelledError as exc:
-                # aiormq can surface a dead connection as a bare CancelledError
-                # from deep inside its own reader/writer plumbing (it uses
-                # cancellation internally to unblock a write that can never
-                # complete) - by exception type alone that's indistinguishable
-                # from *this* task genuinely being cancelled by someone else,
-                # which must never be swallowed. Task.cancelling() tells the two
-                # apart: it only counts actual cancel() calls made against this
-                # task, so if it's zero, nobody asked to cancel us and this can
-                # only be aiormq's internal signal - handle it exactly like any
-                # other publish failure below. Otherwise this is a real
-                # cancellation and has to propagate untouched.
-                task = asyncio.current_task()
-                if task is not None and task.cancelling():
+                if self._task_was_actually_cancelled():
                     # A real cancellation propagates untouched, but nothing past
                     # this point will run the `finally` that normally pops our
                     # own correlation_id (it's further down, after the lock is
@@ -363,7 +382,7 @@ class AMQPTransport(Transport):
 
     async def publish_event(self, name, content):
         """
-        Overriden from the base class
+        Override to publish an event.
 
         Publishes to ``event_exchange`` with routing key ``<prefix>.e.<name>``.
         Every instance which calls :meth:`register_event_callback` with the
@@ -377,17 +396,24 @@ class AMQPTransport(Transport):
         try:
             routing_key = self._event_routing_prefix + name
             logger.info('Publishing event for %s', name)
-            await self._event_exchange.publish(
-                aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
-                routing_key=routing_key,
-            )
+            try:
+                await self._event_exchange.publish(
+                    aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+                    routing_key=routing_key,
+                )
+            except asyncio.CancelledError as exc:
+                if self._task_was_actually_cancelled():
+                    raise
+                self._fail_awaiting_requests(exc)
+                raise ConnectionLostError('Failed to publish event %s: %r' % (name, exc)) from exc
+            except Exception as exc:
+                self._fail_awaiting_requests(exc)
+                raise ConnectionLostError('Failed to publish event %s: %r' % (name, exc)) from exc
         finally:
             self._lock.release()
 
     async def register_event_callback(self, name, callback):
-        """
-        Overriden from the base class
-        """
+        """Override to register an event callback."""
         await self._lock.acquire()
         try:
             queue_name = '%s.q.%s' % (self.prefix, name)
@@ -409,9 +435,7 @@ class AMQPTransport(Transport):
             self._lock.release()
 
     async def unregister_event_callback(self, name):
-        """
-        Overriden from the base class
-        """
+        """Override to unregister an event callback."""
         await self._lock.acquire()
         try:
             queue = self._event_queues.pop(name, None)
@@ -426,7 +450,7 @@ class AMQPTransport(Transport):
 
     async def publish_broadcast(self, name, content):
         """
-        Overriden from the base class
+        Override to publish a broadcast message.
 
         Publishes to ``broadcast_exchange`` with routing key
         ``<prefix>.b.<name>``. Every instance which calls
@@ -438,17 +462,24 @@ class AMQPTransport(Transport):
         try:
             routing_key = self._broadcast_routing_prefix + name
             logger.info('Publishing broadcast for %s', name)
-            await self._broadcast_exchange.publish(
-                aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
-                routing_key=routing_key,
-            )
+            try:
+                await self._broadcast_exchange.publish(
+                    aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+                    routing_key=routing_key,
+                )
+            except asyncio.CancelledError as exc:
+                if self._task_was_register_callactually_cancelled():
+                    raise
+                self._fail_awaiting_requests(exc)
+                raise ConnectionLostError('Failed to publish broadcast %s: %r' % (name, exc)) from exc
+            except Exception as exc:
+                self._fail_awaiting_requests(exc)
+                raise ConnectionLostError('Failed to publish broadcast %s: %r' % (name, exc)) from exc
         finally:
             self._lock.release()
 
     async def register_broadcast_callback(self, name, callback):
-        """
-        Overriden from the base class
-        """
+        """Override to register a broadcast callback."""
         await self._lock.acquire()
         try:
             queue = await self._channel.declare_queue('', exclusive=True, auto_delete=True)
@@ -469,9 +500,7 @@ class AMQPTransport(Transport):
             self._lock.release()
 
     async def unregister_broadcast_callback(self, name):
-        """
-        Overriden from the base class
-        """
+        """Override to unregister a broadcast callback."""
         await self._lock.acquire()
         try:
             queue = self._broadcast_queues.pop(name, None)

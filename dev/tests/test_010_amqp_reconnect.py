@@ -92,26 +92,18 @@ class AMQPReconnectTest(TestCase):
         return transport
 
     async def test_001_publish_after_connection_loss_raises_connection_lost_error(self):
-        """Once the underlying connection is dead, send_request must fail the
-        caller with the documented ``ConnectionLostError`` - never with
-        whatever raw aiormq/aio-pika exception happened to come out of the
-        dead channel (this reproduces the exact second traceback reported: a
-        bare ``ChannelInvalidStateError: <RobustChannel> closed``).
+        """Once the underlying connection is dead, every publish-based call -
+        RPC request, task-queue event, broadcast - must fail the caller with
+        the documented ``ConnectionLostError`` - never with whatever raw
+        aiormq/aio-pika exception happened to come out of the dead channel
+        (this reproduces the exact second traceback reported: a bare
+        ``ChannelInvalidStateError: <RobustChannel> closed``).
 
         Deliberately closing the connection directly (rather than, say,
         killing it via the broker's management API and racing the robust
         reconnect) makes this deterministic: the connection is guaranteed to
-        still be dead by the time we call send_request below, with no
-        dependency on reconnect timing.
-
-        NOTE: publish_event/publish_broadcast are NOT covered here even
-        though they go through the same dead channel. Both declare a
-        queue/exchange (declare_queue/declare_exchange) *before* publishing,
-        and unlike basic_publish, aio_pika's declare_* calls don't notice the
-        channel is closed and raise - they hang forever waiting for a server
-        reply that will never come. That's a separate bug (a hang, not a
-        wrong-exception-type) in a codepath the original report never
-        exercised, and is deliberately left out of scope here.
+        still be dead by the time we make these calls, with no dependency on
+        reconnect timing.
         """
         client_transport = await self._new_transport()
         server_transport = await self._new_transport(queue=self.namespace)
@@ -138,6 +130,12 @@ class AMQPReconnectTest(TestCase):
 
         with self.assertRaises(ConnectionLostError):
             await client_transport.send_request('echo', b'2', timeout=2)
+
+        with self.assertRaises(ConnectionLostError):
+            await client_transport.publish_event('some-queue', b'x')
+
+        with self.assertRaises(ConnectionLostError):
+            await client_transport.publish_broadcast('some-topic', b'x')
 
     async def test_002_idle_heartbeat_timeout_raises_connection_lost_error(self):
         """Simulate the "long inactivity" scenario directly: block the event
