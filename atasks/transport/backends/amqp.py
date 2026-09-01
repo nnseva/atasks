@@ -19,16 +19,34 @@ class AMQPTransport(Transport):
     AMQP transport which uses AMQP for enqueue requests and receive responces
 
     Implements all three atasks patterns on top of a single ``aio_pika``
-    (robust) connection:
+    (robust) connection. Every interaction is declared as a durable **topic**
+    exchange, and it's the routing key alone - never the exchange identity -
+    that keeps the four kinds of traffic apart: ``request_exchange``,
+    ``response_exchange``, ``event_exchange`` and ``broadcast_exchange`` all
+    default to the same name (``'atask'``) and are perfectly happy to resolve
+    to one physical exchange, because each pattern publishes under its own
+    reserved routing-key namespace (``<prefix>.r.``, ``<prefix>.e.``,
+    ``<prefix>.b.`` respectively; the reply-to queue's own random name plays
+    the same role for responses). Point any of them at a different name and
+    nothing else has to change - the routing keys stay just as distinct.
 
-    - RPC (request/response): a topic exchange for requests plus a private
-      exclusive reply-to queue per transport instance, correlated by
-      ``correlation_id`` - see :meth:`send_request`/:meth:`register_callback`.
-    - task-queue (fire-and-forget, competing consumers): one shared durable
-      queue per task name - see :meth:`publish_event`/:meth:`register_event_callback`.
-    - broadcast/subscribe (fire-and-forget, fan-out): one shared fanout
-      exchange per topic name, with one exclusive auto-delete queue per
-      subscribing instance - see :meth:`publish_broadcast`/:meth:`register_broadcast_callback`.
+    - RPC (request/response): requests are published with routing key
+      ``<prefix>.r.<name>``; the worker queue binds ``<prefix>.r.#`` so one
+      queue serves every request name. Responses go out on a private
+      exclusive reply-to queue per transport instance, bound to its own
+      (random) queue name, correlated by ``correlation_id`` - see
+      :meth:`send_request`/:meth:`register_callback`.
+    - task-queue (fire-and-forget, competing consumers): events are published
+      with routing key ``<prefix>.e.<name>``; one shared durable queue per
+      task name binds that exact key, so every instance which calls
+      :meth:`register_event_callback` with the same ``name`` competes for
+      messages off *the same* queue - see
+      :meth:`publish_event`/:meth:`register_event_callback`.
+    - broadcast/subscribe (fire-and-forget, fan-out): broadcasts are published
+      with routing key ``<prefix>.b.<name>``; every subscribing instance binds
+      its own exclusive, auto-delete queue to that exact key, so every
+      subscribed instance gets its own copy of every message - see
+      :meth:`publish_broadcast`/:meth:`register_broadcast_callback`.
 
     Uses ``aio_pika.connect_robust``, so the underlying connection
     automatically reconnects (with ``reconnect_interval`` backoff) after the
@@ -46,6 +64,8 @@ class AMQPTransport(Transport):
         url='amqp://localhost/',
         request_exchange='atask',
         response_exchange='atask',
+        event_exchange='atask',
+        broadcast_exchange='atask',
         prefix='atask',
         queue='atask',
         reconnect_interval=5,
@@ -55,10 +75,18 @@ class AMQPTransport(Transport):
         self.url = url
         self.request_exchange_name = request_exchange
         self.response_exchange_name = response_exchange
+        self.event_exchange_name = event_exchange
+        self.broadcast_exchange_name = broadcast_exchange
         self.prefix = prefix
         self.queue_name = queue
         self.reconnect_interval = reconnect_interval
         self.client_properties = client_properties
+        # Reserved per-pattern routing-key namespaces - see the class
+        # docstring for why these are what keep request/event/broadcast
+        # traffic apart even when their exchanges resolve to the same name.
+        self._request_routing_prefix = '%s.r.' % prefix
+        self._event_routing_prefix = '%s.e.' % prefix
+        self._broadcast_routing_prefix = '%s.b.' % prefix
         self._lock = asyncio.Lock()
         self._awaiting_requests = {}
         self._event_queues = {}
@@ -94,6 +122,8 @@ class AMQPTransport(Transport):
             del self._channel
             del self._request_exchange
             del self._response_exchange
+            del self._event_exchange
+            del self._broadcast_exchange
             del self._response_queue
             del self._response_consumer
             self._event_queues.clear()
@@ -119,18 +149,30 @@ class AMQPTransport(Transport):
             self._connection.close_callbacks.add(self._on_connection_closed)
             self._connection.reconnect_callbacks.add(self._on_reconnected)
             self._channel = await self._connection.channel()
-            self._request_exchange = await self._channel.declare_exchange(
-                self.request_exchange_name,
-                type=aio_pika.ExchangeType.TOPIC,
-                durable=True,
-            )
-            self._response_exchange = self._request_exchange
-            if not self.response_exchange_name == self.request_exchange_name:
-                self._response_exchange = await self._channel.declare_exchange(
-                    self.response_exchange_name,
-                    type=aio_pika.ExchangeType.TOPIC,
-                    durable=True,
-                )
+
+            # All four exchanges are plain durable topics, and their names are
+            # free to coincide (they default to the same 'atask') - it's the
+            # reserved routing-key namespace per pattern, not exchange
+            # identity, that keeps request/response/event/broadcast traffic
+            # apart (see the class docstring). Declaring the same name twice
+            # is harmless (idempotent, same type/durable both times), but the
+            # cache avoids the redundant round-trip in the common case where
+            # they do coincide.
+            declared_exchanges = {}
+
+            async def _get_exchange(name):
+                if name not in declared_exchanges:
+                    declared_exchanges[name] = await self._channel.declare_exchange(
+                        name,
+                        type=aio_pika.ExchangeType.TOPIC,
+                        durable=True,
+                    )
+                return declared_exchanges[name]
+
+            self._request_exchange = await _get_exchange(self.request_exchange_name)
+            self._response_exchange = await _get_exchange(self.response_exchange_name)
+            self._event_exchange = await _get_exchange(self.event_exchange_name)
+            self._broadcast_exchange = await _get_exchange(self.broadcast_exchange_name)
             self._response_queue = await self._channel.declare_queue(
                 '', exclusive=True,
             )
@@ -157,12 +199,23 @@ class AMQPTransport(Transport):
         finally:
             self._lock.release()
 
-    async def _on_connection_closed(self, connection, exc=None):
+    def _fail_awaiting_requests(self, exc=None):
         """
-        Called by aio_pika whenever the underlying connection is lost - including
-        transient drops which the robust connection will retry (with backoff) in
-        the background. Fails every RPC request currently in flight immediately,
-        instead of leaving the caller hanging until (or past) reconnection.
+        Fail every RPC request currently in flight with :class:`ConnectionLostError`,
+        instead of leaving them to hang until (or past) some future reconnect.
+
+        This is the one place that knows how to give up on in-flight requests, so
+        every publish path calls it directly the moment *it* notices the connection
+        is unusable - instead of only reacting to it secondhand, once (and if)
+        :meth:`_on_connection_closed` gets around to it. A publish can fail with a
+        raw aiormq/aio-pika exception (``ChannelInvalidStateError``,
+        ``AMQPConnectionError``, a bare ``CancelledError`` from a write racing the
+        teardown, ...) well before that callback runs, or even without it ever
+        running at all - calling this directly, right there, guarantees the
+        caller always sees the one documented exception type regardless of which
+        code path noticed the connection was gone first. Calling it twice for the
+        same drop (e.g. once from a failed publish and again from the callback) is
+        harmless: whichever runs second finds nothing left to fail.
         """
         if not self._awaiting_requests:
             return
@@ -177,6 +230,15 @@ class AMQPTransport(Transport):
                     'AMQP connection lost while awaiting a response [%s]: %r' % (correlation_id, exc)
                 ))
 
+    async def _on_connection_closed(self, connection, exc=None):
+        """
+        Called by aio_pika whenever the underlying connection is lost - including
+        transient drops which the robust connection will retry (with backoff) in
+        the background. Fails every RPC request currently in flight immediately,
+        instead of leaving the caller hanging until (or past) reconnection.
+        """
+        self._fail_awaiting_requests(exc)
+
     async def _on_reconnected(self, connection):
         """Called by aio_pika after the underlying connection is successfully reestablished."""
         logger.info('Reconnected transport %s', self)
@@ -189,14 +251,15 @@ class AMQPTransport(Transport):
                 self.queue_name,
                 durable=True,
             )
-            logger.info('Binding queue to %s', self.prefix + '.#')
-            await self._queue.bind(self._request_exchange, self.prefix + '.#')
+            binding_key = self._request_routing_prefix + '#'
+            logger.info('Binding queue to %s', binding_key)
+            await self._queue.bind(self._request_exchange, binding_key)
 
             async def _on_message(message):
                 async with message.process():
                     info = message.info()
                     request = message.body
-                name = info['routing_key'][len(self.prefix) + 1:]
+                name = info['routing_key'][len(self._request_routing_prefix):]
                 correlation_id = info['correlation_id']
                 logger.info('Got request for %s[%s]', name, correlation_id)
                 try:
@@ -215,9 +278,13 @@ class AMQPTransport(Transport):
                         ),
                         routing_key=info['reply_to'],
                     )
-                except Exception:
+                except Exception as exc:
                     # TODO: should the failure to publish the response be propagated?
                     logger.exception('Failed to publish response for %s[%s]', name, correlation_id)
+                    # If this transport instance is also used to make outbound
+                    # requests (client and server sharing one instance) and the
+                    # connection just died, don't leave those hanging either.
+                    self._fail_awaiting_requests(exc)
 
             self._consumer = await self._queue.consume(_on_message)
         finally:
@@ -234,15 +301,49 @@ class AMQPTransport(Transport):
             future = asyncio.get_event_loop().create_future()
             self._awaiting_requests[correlation_id] = future
             logger.info('Publishing for %s[%s]', name, correlation_id)
-            await self._request_exchange.publish(
-                aio_pika.Message(
-                    correlation_id=correlation_id,
-                    body=content,
-                    reply_to=self._response_queue.name,
-                ),
-                routing_key='%s.%s' % (self.prefix, name),
-            )
-            logger.debug('Published for %s[%s]', name, correlation_id)
+            try:
+                await self._request_exchange.publish(
+                    aio_pika.Message(
+                        correlation_id=correlation_id,
+                        body=content,
+                        reply_to=self._response_queue.name,
+                    ),
+                    routing_key=self._request_routing_prefix + name,
+                )
+            except asyncio.CancelledError as exc:
+                # aiormq can surface a dead connection as a bare CancelledError
+                # from deep inside its own reader/writer plumbing (it uses
+                # cancellation internally to unblock a write that can never
+                # complete) - by exception type alone that's indistinguishable
+                # from *this* task genuinely being cancelled by someone else,
+                # which must never be swallowed. Task.cancelling() tells the two
+                # apart: it only counts actual cancel() calls made against this
+                # task, so if it's zero, nobody asked to cancel us and this can
+                # only be aiormq's internal signal - handle it exactly like any
+                # other publish failure below. Otherwise this is a real
+                # cancellation and has to propagate untouched.
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    # A real cancellation propagates untouched, but nothing past
+                    # this point will run the `finally` that normally pops our
+                    # own correlation_id (it's further down, after the lock is
+                    # released) - clean it up here so it doesn't linger in
+                    # _awaiting_requests forever if a response never arrives.
+                    self._awaiting_requests.pop(correlation_id, None)
+                    raise
+                self._fail_awaiting_requests(exc)
+            except Exception as exc:
+                # The publish itself failed - almost always because the connection
+                # is gone or mid-reconnect. Route it through the same cleanup
+                # _on_connection_closed uses: this fails *our own* future (among
+                # any other in-flight ones) with ConnectionLostError, which the
+                # await below then raises immediately - no separate raise needed
+                # here, and the caller sees the same exception type regardless of
+                # whether the publish failed outright or the connection dropped
+                # while we were waiting for a response.
+                self._fail_awaiting_requests(exc)
+            else:
+                logger.debug('Published for %s[%s]', name, correlation_id)
         finally:
             self._lock.release()
         try:
@@ -264,20 +365,21 @@ class AMQPTransport(Transport):
         """
         Overriden from the base class
 
-        Declares (idempotently) a durable queue named after ``name`` so an event
-        published before any consumer has started isn't silently dropped, then
-        publishes directly to it via the default exchange. Every instance which
-        calls :meth:`register_event_callback` with the same ``name`` consumes
-        from *the same* queue, so they compete for each message.
+        Publishes to ``event_exchange`` with routing key ``<prefix>.e.<name>``.
+        Every instance which calls :meth:`register_event_callback` with the
+        same ``name`` binds *the same* durable queue to that exact key, so
+        they compete for each message. Note this means a message published
+        before any consumer has ever registered for ``name`` - so no queue is
+        bound to that key yet - is dropped, same as an unroutable message on
+        any exchange.
         """
         await self._lock.acquire()
         try:
-            queue_name = '%s.q.%s' % (self.prefix, name)
-            queue = await self._channel.declare_queue(queue_name, durable=True)
+            routing_key = self._event_routing_prefix + name
             logger.info('Publishing event for %s', name)
-            await self._channel.default_exchange.publish(
+            await self._event_exchange.publish(
                 aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
-                routing_key=queue.name,
+                routing_key=routing_key,
             )
         finally:
             self._lock.release()
@@ -290,6 +392,7 @@ class AMQPTransport(Transport):
         try:
             queue_name = '%s.q.%s' % (self.prefix, name)
             queue = await self._channel.declare_queue(queue_name, durable=True)
+            await queue.bind(self._event_exchange, self._event_routing_prefix + name)
 
             async def _on_event_message(message):
                 async with message.process():
@@ -325,24 +428,19 @@ class AMQPTransport(Transport):
         """
         Overriden from the base class
 
-        Declares (idempotently) a durable fanout exchange named after ``name``
-        and publishes to it with no routing key. Every instance which calls
-        :meth:`register_broadcast_callback` with the same ``name`` gets its own
-        exclusive, auto-delete queue bound to this exchange, so every subscribed
-        instance receives its own copy of every message.
+        Publishes to ``broadcast_exchange`` with routing key
+        ``<prefix>.b.<name>``. Every instance which calls
+        :meth:`register_broadcast_callback` with the same ``name`` binds its
+        own exclusive, auto-delete queue to that exact key, so every
+        subscribed instance receives its own copy of every message.
         """
         await self._lock.acquire()
         try:
-            exchange_name = '%s.fanout.%s' % (self.prefix, name)
-            exchange = await self._channel.declare_exchange(
-                exchange_name,
-                type=aio_pika.ExchangeType.FANOUT,
-                durable=True,
-            )
+            routing_key = self._broadcast_routing_prefix + name
             logger.info('Publishing broadcast for %s', name)
-            await exchange.publish(
+            await self._broadcast_exchange.publish(
                 aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
-                routing_key='',
+                routing_key=routing_key,
             )
         finally:
             self._lock.release()
@@ -353,14 +451,8 @@ class AMQPTransport(Transport):
         """
         await self._lock.acquire()
         try:
-            exchange_name = '%s.fanout.%s' % (self.prefix, name)
-            exchange = await self._channel.declare_exchange(
-                exchange_name,
-                type=aio_pika.ExchangeType.FANOUT,
-                durable=True,
-            )
             queue = await self._channel.declare_queue('', exclusive=True, auto_delete=True)
-            await queue.bind(exchange, routing_key='')
+            await queue.bind(self._broadcast_exchange, self._broadcast_routing_prefix + name)
 
             async def _on_broadcast_message(message):
                 async with message.process():

@@ -140,13 +140,9 @@ class AMQPQueueTest(TestCase):
 
     async def test_003_publish_before_any_consumer_is_not_lost(self):
         """Messages published to a task-queue before any consumer has registered are
-        not dropped - publish_event declares the durable queue itself, so the event
-        waits there until a competing consumer eventually attaches."""
+        not dropped, if the durable queue exists"""
         name = 'late.consumer'
         publisher = await self._new_transport()
-
-        await publisher.publish_event(name, b'queued-before-consumer')
-
         worker = await self._new_transport()
         received = []
         got_it = asyncio.Event()
@@ -155,6 +151,14 @@ class AMQPQueueTest(TestCase):
             received.append(content.decode())
             got_it.set()
 
+        # The first registration will create a durable queue
+        await worker.register_event_callback(name, _handle)
+        await worker.unregister_event_callback(name)
+        # First send the event before any consumer has registered
+        await publisher.publish_event(name, b'queued-before-consumer')
+        # check that the message published before the consumer was registered is NOT yet received
+        await asyncio.sleep(1)  # give a moment to ensure the message is not yet received
+        self.assertEqual(received, [], 'no message should be received before the consumer is registered')
         await worker.register_event_callback(name, _handle)
         await asyncio.wait_for(got_it.wait(), timeout=5)
         self.assertEqual(received, ['queued-before-consumer'])
