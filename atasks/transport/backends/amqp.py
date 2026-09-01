@@ -258,9 +258,25 @@ class AMQPTransport(Transport):
         this task, so if it is zero, nobody asked to cancel us and a
         ``CancelledError`` reaching a caller of this can only be aiormq's
         internal signal, safe to treat like any other publish failure.
+
+        ``Task.cancelling()`` itself was only added in Python 3.11 - this
+        package supports 3.10 too (see setup.py/tox.ini), where there is no
+        equivalent public API to tell the two cases apart. On 3.10, every
+        CancelledError is conservatively treated as a real cancellation (this
+        returns True unconditionally) and left to propagate untouched,
+        matching asyncio's own rule that a cancellation must never be
+        swallowed. The cost, on 3.10 only, is that the narrow case this
+        mechanism exists for (see dev/tests/test_010_amqp_reconnect.py's
+        heartbeat-timeout test) surfaces a raw CancelledError instead of the
+        documented ConnectionLostError - the same as before this was fixed.
         """
         task = asyncio.current_task()
-        return task is not None and bool(task.cancelling())
+        if task is None:
+            return False
+        cancelling = getattr(task, 'cancelling', None)
+        if cancelling is None:
+            return True
+        return bool(cancelling())
 
     async def _on_connection_closed(self, connection, exc=None):
         """

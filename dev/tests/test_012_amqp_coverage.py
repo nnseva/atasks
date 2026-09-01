@@ -41,6 +41,13 @@ MANAGEMENT_USER = os.environ.get('ATASKS_TEST_AMQP_MANAGEMENT_USER', 'guest')
 MANAGEMENT_PASSWORD = os.environ.get('ATASKS_TEST_AMQP_MANAGEMENT_PASSWORD', 'guest')
 MANAGEMENT_AUTH = base64.b64encode(('%s:%s' % (MANAGEMENT_USER, MANAGEMENT_PASSWORD)).encode()).decode()
 
+# See the identical constant in test_010_amqp_reconnect.py: on Python 3.10
+# (still supported - setup.py/tox.ini), AMQPTransport._task_was_actually_cancelled()
+# has no Task.cancelling() to work with and conservatively lets every
+# CancelledError propagate untouched, so the heartbeat-timeout tests below
+# see a raw CancelledError there instead of the normalized ConnectionLostError.
+_SUPPORTS_TASK_CANCELLING = hasattr(asyncio.Task, 'cancelling')
+
 
 def _fresh_namespace():
     return 'test-amqp-coverage-%s' % uuid.uuid4().hex
@@ -197,7 +204,17 @@ class AMQPCoverageTest(TestCase):
 
         time.sleep(7)  # no heartbeats can be sent/processed while this runs
 
-        with self.assertRaises(ConnectionLostError):
+        # Which raw exception aiormq raises for the same heartbeat-timeout
+        # race is itself non-deterministic - sometimes a plain socket-level
+        # AMQPConnectionError (already normalized fine on any Python
+        # version, via the plain `except Exception` branch), sometimes a
+        # bare CancelledError specifically. Only in the latter case does the
+        # Python version matter: 3.11+ normalizes it too (via
+        # Task.cancelling()); 3.10 conservatively re-raises it untouched -
+        # see test_010_amqp_reconnect.py for the same reasoning in full.
+        expected_exc = (ConnectionLostError, asyncio.CancelledError) if not _SUPPORTS_TASK_CANCELLING \
+            else ConnectionLostError
+        with self.assertRaises(expected_exc):
             await transport.publish_event('some-queue', b'x')
 
     async def test_005_publish_broadcast_idle_heartbeat_timeout_becomes_connection_lost(self):
@@ -209,7 +226,17 @@ class AMQPCoverageTest(TestCase):
 
         time.sleep(7)
 
-        with self.assertRaises(ConnectionLostError):
+        # Which raw exception aiormq raises for the same heartbeat-timeout
+        # race is itself non-deterministic - sometimes a plain socket-level
+        # AMQPConnectionError (already normalized fine on any Python
+        # version, via the plain `except Exception` branch), sometimes a
+        # bare CancelledError specifically. Only in the latter case does the
+        # Python version matter: 3.11+ normalizes it too (via
+        # Task.cancelling()); 3.10 conservatively re-raises it untouched -
+        # see test_010_amqp_reconnect.py for the same reasoning in full.
+        expected_exc = (ConnectionLostError, asyncio.CancelledError) if not _SUPPORTS_TASK_CANCELLING \
+            else ConnectionLostError
+        with self.assertRaises(expected_exc):
             await transport.publish_broadcast('some-topic', b'x')
 
     # -- a handler raising must not crash the consumer or leave the caller hanging --
@@ -387,7 +414,21 @@ class AMQPCoverageTest(TestCase):
         self.assertEqual(received, [b'before-unregister'])
 
         await subscriber.unregister_broadcast_callback(name)
-        await publisher.publish_broadcast(name, b'after-unregister')
+        # Give the now-consumerless exclusive/auto-delete queue a moment to
+        # actually disappear broker-side before publishing again.
+        await asyncio.sleep(0.3)
+        try:
+            await publisher.publish_broadcast(name, b'after-unregister')
+        except ConnectionLostError:
+            # A message published to a routing key with no bound queue can,
+            # right in the window where the last consumer just unsubscribed
+            # and its auto-delete queue is disappearing, come back as a
+            # delivery nack instead of being silently dropped as unroutable -
+            # observed in CI (RabbitMQ 4.3.5) though not reproduced locally.
+            # Either way, what this test actually checks is that the old
+            # handler never sees the message - not that the publish call
+            # itself is guaranteed to succeed in this specific timing window.
+            pass
         await asyncio.sleep(0.5)
         self.assertEqual(received, [b'before-unregister'])  # nothing more arrived
 
@@ -433,7 +474,7 @@ class AMQPCoverageTest(TestCase):
         await asyncio.sleep(6)
         before_names = await self._list_connection_names()
 
-        transport = await self._new_transport()
+        await self._new_transport()
         connection_name = await self._find_new_connection_name(before_names)
         if connection_name is None:
             self.skipTest("Could not identify the transport's AMQP connection via the management API")

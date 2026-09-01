@@ -49,6 +49,16 @@ from atasks.transport.base import ConnectionLostError
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
 
+# Task.cancelling() (Python 3.11+) is what lets AMQPTransport tell a real task
+# cancellation apart from aiormq's own internal use of CancelledError as a
+# connection-death signal - see _task_was_actually_cancelled() in amqp.py. On
+# 3.10 (still supported - see setup.py/tox.ini) there is no such API, so the
+# transport conservatively treats every CancelledError as real and lets it
+# propagate untouched rather than risk swallowing a genuine cancellation -
+# meaning the heartbeat-timeout race below surfaces a raw CancelledError
+# there instead of the normalized ConnectionLostError.
+_SUPPORTS_TASK_CANCELLING = hasattr(asyncio.Task, 'cancelling')
+
 
 def _fresh_namespace():
     return 'test-amqp-reconnect-%s' % uuid.uuid4().hex
@@ -173,5 +183,14 @@ class AMQPReconnectTest(TestCase):
         # down concurrently with whatever runs the moment the loop wakes up.
         time.sleep(7)
 
-        with self.assertRaises(ConnectionLostError):
+        # Which raw exception aiormq raises for the same heartbeat-timeout
+        # race is itself non-deterministic - sometimes a plain socket-level
+        # AMQPConnectionError (already normalized fine on any Python
+        # version, via the plain `except Exception` branch), sometimes a
+        # bare CancelledError specifically. Only in the latter case does the
+        # Python version matter: 3.11+ normalizes it too (via
+        # Task.cancelling()); 3.10 conservatively re-raises it untouched.
+        expected_exc = (ConnectionLostError, asyncio.CancelledError) if not _SUPPORTS_TASK_CANCELLING \
+            else ConnectionLostError
+        with self.assertRaises(expected_exc):
             await echo(2)
