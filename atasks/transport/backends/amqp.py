@@ -468,7 +468,7 @@ class AMQPTransport(Transport):
                     routing_key=routing_key,
                 )
             except asyncio.CancelledError as exc:
-                if self._task_was_register_callactually_cancelled():
+                if self._task_was_actually_cancelled():
                     raise
                 self._fail_awaiting_requests(exc)
                 raise ConnectionLostError('Failed to publish broadcast %s: %r' % (name, exc)) from exc

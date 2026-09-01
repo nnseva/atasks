@@ -38,6 +38,7 @@ setup(
             'isort',
             'pydocstyle',
             'backoff',
+            'coverage',
         ],
     },
     setup_requires=['setuptools-scm>=8'],
