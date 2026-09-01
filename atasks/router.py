@@ -3,7 +3,10 @@ ATasks Router
 """
 
 import logging
+import socket
+import sys
 
+from atasks import trace
 from atasks.codecs import get_codec
 from atasks.namespaces import namespaces
 from atasks.registry import Manager
@@ -41,17 +44,57 @@ class Router(object):
 
     It is registered in the namespace and uses codec and transport from it.
     """
-    def __init__(self, namespace='default'):
+    def __init__(
+        self,
+        namespace='default',
+        hostname=None,
+        max_trace_depth=1000,
+        trace_filter_modules=None,
+        collect_await_frames=True,
+    ):
         """
         Constructor
 
+        To have ``hostname`` (or the other trace options below) taken into
+        account, construct the ``Router`` yourself before the first direct or
+        indirect call to :func:`get_router` for this namespace - it will then
+        return this instance. :func:`get_router` itself is unchanged and
+        keeps auto-creating a default-configured ``Router`` on first use.
+
         :param namespace: name of the namespace which the router will use to send requests
         :type namespace: str
+        :param hostname: host identification recorded in every atask call
+                         trace made through this router. Defaults to
+                         ``socket.gethostname()`` (a local, non-blocking call -
+                         no resolver is involved). Uniqueness across the
+                         deployment is the deployer's responsibility.
+        :type hostname: str or None
+        :param max_trace_depth: maximum number of atask hops (not counting
+                                 ordinary ``await`` frames) allowed in a call
+                                 chain before :class:`atasks.trace.AtaskStackTooDeep`
+                                 is raised - a guard against runaway recursive
+                                 or cyclic atask calls
+        :type max_trace_depth: int
+        :param trace_filter_modules: dotted module name prefixes (e.g.
+                                      ``('atasks', 'backoff')``) whose frames
+                                      are excluded from the ordinary-``await``
+                                      part of the trace. Defaults to no
+                                      filtering - every frame, library
+                                      internals included, is kept.
+        :type trace_filter_modules: list or tuple or None
+        :param collect_await_frames: if ``False``, ordinary ``await`` frames
+                                      are not collected at all - the trace
+                                      then holds only atask hops
+        :type collect_await_frames: bool
         """
         logger.info("Creating a router for %s", namespace)
         namespaces.register(namespace, router=self, registry=Manager(namespace, unite=False))
         self.namespace = namespace
         self.server = None
+        self.hostname = hostname if hostname is not None else socket.gethostname()
+        self.max_trace_depth = max_trace_depth
+        self.trace_filter_modules = tuple(trace_filter_modules or ())
+        self.collect_await_frames = collect_await_frames
 
     async def activate(self, server):
         """
@@ -82,7 +125,7 @@ class Router(object):
             await self.server.unregister_callback()
         self.server = None
 
-    async def send_request(self, name, *argv, timeout=None, **kwargs):
+    async def send_request(self, name, *argv, timeout=None, trace_chain=(), **kwargs):
         """
         Send a request.
 
@@ -98,6 +141,9 @@ class Router(object):
         :param timeout: maximum number of seconds to wait for a response. ``None``
                         (default) waits forever, preserving the historical behaviour.
         :type timeout: float or None
+        :param trace_chain: atask call chain to send along with the request, as built by
+                            :func:`atasks.trace.push_hop`
+        :type trace_chain: tuple
         :param kwargs: arbitrary named parameters
         :returns: success flag and job awaiting result, or exception in case of the exception handled
         :raises atasks.transport.base.RequestTimeoutError: if ``timeout`` elapses with no response
@@ -112,7 +158,7 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        content = await codec.encode((argv, kwargs))
+        content = await codec.encode((argv, kwargs, trace_chain))
         logger.debug('Sending request %s using %s', name, client)
         response = await client.send_request(name, content, timeout=timeout)
         logger.debug('Response for %s returned', name)
@@ -124,7 +170,7 @@ class Router(object):
             raise result
         return result
 
-    async def send_event(self, name, *argv, **kwargs):
+    async def send_event(self, name, *argv, trace_chain=(), **kwargs):
         """
         Publish a fire-and-forget task-queue event (see :meth:`register_queue_task`).
 
@@ -135,6 +181,9 @@ class Router(object):
         :param name: name of the queue/task
         :type name: str
         :param argv: arbitrary positional parameters
+        :param trace_chain: atask call chain to send along with the event, as built by
+                            :func:`atasks.trace.push_hop`
+        :type trace_chain: tuple
         :param kwargs: arbitrary named parameters
         """
         logger.debug('Sending event %s %s %s', name, argv, kwargs)
@@ -146,10 +195,10 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        content = await codec.encode((argv, kwargs))
+        content = await codec.encode((argv, kwargs, trace_chain))
         await client.publish_event(name, content)
 
-    async def send_broadcast(self, name, *argv, **kwargs):
+    async def send_broadcast(self, name, *argv, trace_chain=(), **kwargs):
         """
         Publish a fan-out event (see :meth:`register_broadcast_task`).
 
@@ -160,6 +209,9 @@ class Router(object):
         :param name: name of the broadcast topic
         :type name: str
         :param argv: arbitrary positional parameters
+        :param trace_chain: atask call chain to send along with the event, as built by
+                            :func:`atasks.trace.push_hop`
+        :type trace_chain: tuple
         :param kwargs: arbitrary named parameters
         """
         logger.debug('Sending broadcast %s %s %s', name, argv, kwargs)
@@ -171,7 +223,7 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        content = await codec.encode((argv, kwargs))
+        content = await codec.encode((argv, kwargs, trace_chain))
         await client.publish_broadcast(name, content)
 
     async def _on_request(self, name, content):
@@ -196,7 +248,7 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        argv, kwargs = await codec.decode(content)
+        argv, kwargs, trace_chain = await codec.decode(content)
         item = namespaces.get(self.namespace).registry.get(name)
         if not item:
             raise JobNotFound(name)
@@ -205,7 +257,14 @@ class Router(object):
         options = item.options
 
         logger.debug('Request received %s with %s %s', name, argv, kwargs)
-        success, result = await self._call_coro(coro, argv, kwargs, options)
+        token = trace.enter(trace_chain)
+        try:
+            success, result = await self._call_coro(coro, argv, kwargs, options)
+        finally:
+            trace.leave(token)
+        # RPC failures are routed back to the caller as-is (together with the
+        # atask trace attached by _call_coro) and are never logged here - the
+        # caller decides whether/how to log what it does with the exception.
         logger.debug('Request %s response returning success = %s: %s', name, success, result)
         response = await codec.encode((success, result))
         logger.info('Request %s response returning', name)
@@ -228,14 +287,21 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        argv, kwargs = await codec.decode(content)
+        argv, kwargs, trace_chain = await codec.decode(content)
         item = namespaces.get(self.namespace).registry.get(name)
         if not item:
             raise JobNotFound(name)
 
-        success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        token = trace.enter(trace_chain)
+        try:
+            success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        finally:
+            trace.leave(token)
         if not success:
-            logger.error('Queue task %s raised an exception: %r', name, result)
+            # A queue task has no caller waiting for a response - the failure
+            # terminates here, so the full collected trace is logged in full,
+            # instead of just the exception's repr.
+            logger.error('Queue task %s raised an exception:\n%s', name, trace.format_trace(result))
 
     async def _on_broadcast(self, name, content):
         """
@@ -254,23 +320,44 @@ class Router(object):
         if not codec:
             raise NoCodecRegistered()
 
-        argv, kwargs = await codec.decode(content)
+        argv, kwargs, trace_chain = await codec.decode(content)
         item = namespaces.get(self.namespace).registry.get(name)
         if not item:
             raise JobNotFound(name)
 
-        success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        token = trace.enter(trace_chain)
+        try:
+            success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+        finally:
+            trace.leave(token)
         if not success:
-            logger.error('Broadcast task %s raised an exception: %r', name, result)
+            # A broadcast task has no caller waiting for a response - the failure
+            # terminates here, so the full collected trace is logged in full,
+            # instead of just the exception's repr.
+            logger.error('Broadcast task %s raised an exception:\n%s', name, trace.format_trace(result))
 
     async def _call_coro(self, coro, argv, kwargs, options):
         """
         Calls coroutine and returns success flag and result or exception
+
+        On failure, attaches the atask call chain collected so far to the
+        exception (see :func:`atasks.trace.attach`) before returning it.
+
+        Marks this frame's ``await coro(...)`` line as the current hop's entry
+        point for the duration of the call - the boundary
+        :func:`atasks.trace.push_hop`/:func:`atasks.trace.attach` use to keep
+        ordinary-``await`` frames scoped to this hop's own execution, instead
+        of reaching back through the atasks library/transport/event-loop
+        plumbing into a previous hop.
         """
+        token = trace.ENTRY_FRAME.set(sys._getframe())
         try:
             result = await coro(*argv, **kwargs)
         except Exception as ex:
+            trace.attach(ex, self)
             return False, ex
+        finally:
+            trace.ENTRY_FRAME.reset(token)
 
         return True, result
 
@@ -295,7 +382,10 @@ class Router(object):
         default_timeout = options.get('timeout')
 
         async def aioref(*argv, **kwargs):
-            result = await get_router(namespace).send_request(name, *argv, timeout=default_timeout, **kwargs)
+            chain = trace.push_hop(self, name, namespace, 'rpc')
+            result = await get_router(namespace).send_request(
+                name, *argv, timeout=default_timeout, trace_chain=chain, **kwargs
+            )
             return result
 
         aioref.__qualname__ = 'ref[%s/%s]' % (name, namespace)
@@ -324,7 +414,8 @@ class Router(object):
         namespaces.get(namespace).registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
-            await get_router(namespace).send_event(name, *argv, **kwargs)
+            chain = trace.push_hop(self, name, namespace, 'queue')
+            await get_router(namespace).send_event(name, *argv, trace_chain=chain, **kwargs)
 
         aioref.__qualname__ = 'queue[%s/%s]' % (name, namespace)
         logger.info('Registered queue task %s', aioref)
@@ -352,7 +443,8 @@ class Router(object):
         namespaces.get(namespace).registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
-            await get_router(namespace).send_broadcast(name, *argv, **kwargs)
+            chain = trace.push_hop(self, name, namespace, 'broadcast')
+            await get_router(namespace).send_broadcast(name, *argv, trace_chain=chain, **kwargs)
 
         aioref.__qualname__ = 'broadcast[%s/%s]' % (name, namespace)
         logger.info('Registered broadcast task %s', aioref)

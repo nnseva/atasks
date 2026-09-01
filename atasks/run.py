@@ -19,7 +19,7 @@ exit_run = False
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
     from atasks.codecs import PickleCodec
-    from atasks.router import get_router
+    from atasks.router import Router, get_router
     from atasks.transport.backends.amqp import AMQPTransport
     from atasks.transport.base import LoopbackTransport
 
@@ -34,6 +34,14 @@ async def aiomain(**options):
         'amqp': AMQPTransport
     }[options['transport']](**kw)
     await transport.connect()
+    if options.get('hostname'):
+        # Constructing the Router ourselves, before the first get_router()
+        # call below, is what lets an explicit --hostname reach it - see the
+        # Router constructor docstring. Only done when actually requested:
+        # get_router() below is otherwise left to lazily create (or reuse) the
+        # namespace's Router exactly as before, so a namespace already set up
+        # by earlier code (its task registry included) is left untouched.
+        Router(hostname=options['hostname'])
     try:
         router = get_router()
         if options['mode'] in ('server', 'loopback'):
@@ -116,6 +124,13 @@ def main(argv):
         '-U', '--url',
         dest='url',
         help='URL for the transport',
+    )
+
+    parser.add_argument(
+        '-H', '--hostname',
+        dest='hostname',
+        default=None,
+        help='Host identification recorded in atask call traces, default: auto-detected via socket.gethostname()',
     )
 
     parser.add_argument(

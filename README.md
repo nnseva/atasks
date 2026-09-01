@@ -358,32 +358,52 @@ auto-delete queue:
   revisit this if it becomes a bottleneck - not something this package
   solves today.
 
-## Idempotency - at-least-once delivery
+## Delivery guarantees and idempotency - at-most-once, never exactly-once
 
 **All three patterns - `@atask` (RPC), `@atask_queue` (task-queue), and
-`@atask_broadcast` (broadcast) - are at-least-once, never exactly-once.** A
-function exposed through any of them can run more than once for what looks
-like a single logical event:
+`@atask_broadcast` (broadcast) - are at-most-once at the message-delivery
+level, not at-least-once.** Every message is acknowledged to the broker as
+soon as it is *received*, before the registered handler ever runs - an
+architectural constraint, not an oversight: see the comment above
+`_on_message` in `atasks/transport/backends/amqp.py` for why deferring the
+ack until the handler finishes isn't safe here (a single transport's RPC
+consumer shares one AMQP prefetch slot across every task name it serves, and
+delaying the ack that long deadlocks on any nested/self-referential call
+chain - one task's handler calling another task the same worker also
+serves). The practical consequence: **if the process handling a message
+crashes, is killed, or loses its connection while the handler is still
+running, that message is gone.** AMQP will not redeliver it to another
+consumer, and nothing else will ever be told the work didn't happen.
 
-- an RPC reply can be lost (network blip, broker restart) after the worker
-  already executed successfully, and a caller-side retry (manual, or via
-  `backoff.on_exception` as shown above) will then invoke the function again;
-- a task-queue or broadcast consumer can crash after processing a message but
-  before its ack reaches the broker, so the message (or, for
-  auto-acknowledged exclusive queues, a message the consumer never got to
-  acknowledge before disconnecting) is redelivered to another consumer (or to
-  the same one after it recovers);
-- a `RequestTimeoutError`-triggered caller-side retry can race a
-  slow-but-still-running worker, resulting in two executions of the same
-  logical call.
+- For RPC (`@atask`), this loss is at least observable from the caller's
+  side: `send_request` is still waiting on a reply that will now never
+  arrive, so it surfaces as `RequestTimeoutError` (or `ConnectionLostError`,
+  if the connection itself drops - see "When the worker evaluating `atask`
+  is crashed" below). If the call site follows the documented caller-side
+  `backoff.on_exception` pattern, that retry re-issues a brand-new request -
+  which can end up running the underlying function twice (if the crashed
+  worker had actually finished the work moments before dying, just never got
+  to reply) rather than exactly once. This retry is an application-level
+  convention this package documents and expects you to add - not something
+  AMQP or this library provides automatically.
+- For `@atask_queue`/`@atask_broadcast`, there is no caller waiting for
+  anything to compare against: `publish_event`/`publish_broadcast` return as
+  soon as the message is handed to the broker, with no confirmation that it
+  was ever processed. If the consumer that picked it up then crashes
+  mid-handler, the work is silently dropped - no retry, no error, no log
+  anywhere pointing at it. Anything that must survive a crash mid-processing
+  has to be built on top of these two patterns (the handler durably
+  recording its own progress/results before returning, an application-level
+  dead-letter queue, external monitoring, etc.) - it does not come for free.
 
-**This package deliberately does not attempt to solve this for you** - de-
-duplication (idempotency keys, "processed event" tables, `INSERT ... ON
-CONFLICT DO NOTHING`-style upserts, etc.) is the caller's/handler's
-responsibility, exactly as it is for any other at-least-once delivery system
-(cloud pub/sub, SQS, periodic cron jobs that might overlap). Every function
-registered with `@atask`, `@atask_queue`, or `@atask_broadcast` should be
-written to be safely callable more than once with the same logical input.
+**This package deliberately does not attempt to solve either problem for
+you.** For RPC, de-duplication (idempotency keys, "processed event" tables,
+`INSERT ... ON CONFLICT DO NOTHING`-style upserts, etc.) is the
+caller's/handler's responsibility whenever a caller-side retry is in play -
+every function registered with `@atask` should be safe to run more than once
+for the same logical input. For `@atask_queue`/`@atask_broadcast`, surviving
+a crash mid-processing is the handler's own responsibility to design for, if
+the use case needs it at all - the delivery mechanism itself won't help.
 
 ## Namespaces
 
@@ -531,8 +551,55 @@ Every step of the RPC round trip is logged (`atasks.router` and
 `correlation_id`, so grepping a single correlation_id across client and
 worker logs reconstructs the whole round trip: request published, request
 received, response returning, response received (or the point at which it
-stopped - see below). There is no separate tracing/monitoring API beyond
-these logs today.
+stopped - see below).
+
+On top of that, `atasks.trace` builds and carries, across however many `atask`
+hops and hosts a call chain crosses, the chain of `atask` calls (RPC/queue/
+broadcast) that led to whatever is currently running - and, unless disabled,
+the ordinary `await` frames in between. No call arguments are ever recorded,
+only call sites (file/line/function), atask/namespace/kind, a host
+identification, a per-call id and a timestamp.
+
+Every `atask` call chain starts at the root (the first `atask` called, however
+it was called), and is attached to an exception the first time it is caught,
+as `exception.__atask_trace__` - fetch it with `atasks.trace.get_trace(exc)`,
+or get it pre-rendered as readable text (atask hops picked out from the
+ordinary frames) with `atasks.trace.format_trace(exc)`:
+
+```python
+from atasks import trace
+
+try:
+    await some_task(...)
+except Exception as exc:
+    info = trace.get_trace(exc)      # AtaskTrace, or None
+    print(trace.format_trace(exc))   # human-readable, ready to log
+```
+
+- An RPC (`@atask`) failure is routed back to the caller exactly as before,
+  with the trace attached, and is **not** logged by the router itself - the
+  caller decides whether/how to log it.
+- An `atask_queue`/`atask_broadcast` failure has no caller to report back to,
+  so it terminates where it happened, logging the full collected trace instead
+  of a bare exception `repr()`.
+
+Host identification, the call-depth guard, and whether/what to filter out of
+the ordinary-`await` frames are all set on `Router`, and must be set *before*
+the first direct or indirect call to `get_router()` for the namespace - after
+that, `get_router()` returns the instance you constructed:
+
+```python
+from atasks.router import Router
+
+Router(
+    hostname='worker-fleet-2',       # default: socket.gethostname()
+    max_trace_depth=1000,            # atask hops only; guards against runaway recursion/cycles
+    trace_filter_modules=('atasks', 'backoff'),  # default: none filtered
+    collect_await_frames=True,       # False: trace holds only atask hops, no ordinary frames
+)
+```
+
+`run.py` exposes the host identification as `--hostname`/`-H`.
 
 ## When the `atask` is crashed
 

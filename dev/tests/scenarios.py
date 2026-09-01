@@ -5,6 +5,7 @@ Processed scenarios
 import asyncio
 import logging
 
+from atasks import trace
 from atasks.tasks import atask
 
 
@@ -34,6 +35,40 @@ async def task_three(a):
     """Yet another example task"""
     logger.info("task_three evaluating: {}".format(a))
     return a
+
+
+@atask
+async def task_except_top(a):
+    """Exception from sub-atask"""
+    try:
+        await task_except(a)
+    except Exception as e:
+        logger.error("task_except_top encountered an exception: {}".format(e))
+        print(trace.format_trace(e))
+        raise
+
+
+@atask
+async def task_except(a):
+    """Exception example task"""
+    logger.info("task_except starting: {}".format(a))
+    try:
+        await async_except(a)
+    except Exception as e:
+        logger.error("task_except encountered an exception: {}".format(e))
+        print(trace.format_trace(e))
+        raise
+
+
+async def async_except(a):
+    """Internal exception example"""
+    logger.info("async_except starting: {}".format(a))
+    try:
+        raise Exception("Intentional exception in async_except({})".format(a))
+    except Exception as e:
+        logger.error("async_except encountered an exception: {}".format(e))
+        print(trace.format_trace(e))
+        raise
 
 
 @atask
