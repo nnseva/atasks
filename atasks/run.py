@@ -34,40 +34,58 @@ async def aiomain(**options):
         'amqp': AMQPTransport
     }[options['transport']](**kw)
     await transport.connect()
-    router = get_router()
-    if options['mode'] in ('server', 'loopback'):
-        await router.activate(transport)
+    try:
+        router = get_router()
+        if options['mode'] in ('server', 'loopback'):
+            await router.activate(transport)
+        try:
+            futures = []
+            for filename in options['scenario']:
+                if os.path.exists(filename) and os.path.isfile(filename):
+                    name = os.path.basename(filename).rsplit('.', 1)[0]
+                    spec = importlib.util.spec_from_file_location(name, filename)
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[name] = module
+                    spec.loader.exec_module(module)
+                else:
+                    module = importlib.import_module(filename)
 
-    futures = []
-    for filename in options['scenario']:
-        if os.path.exists(filename) and os.path.isfile(filename):
-            name = os.path.basename(filename).rsplit('.', 1)[0]
-            spec = importlib.util.spec_from_file_location(name, filename)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-        else:
-            module = importlib.import_module(filename)
+                if hasattr(module, 'aiomain'):
+                    futures.append(module.aiomain(**options))
 
-        if hasattr(module, 'aiomain'):
-            futures.append(module.aiomain(**options))
+            if futures:
+                await asyncio.gather(*futures)
 
-    if futures:
-        await asyncio.gather(*futures)
+            if options['mode'] == 'server':
+                logger.info("Listening for requests")
+                for s in set([
+                    signal.SIGINT,
+                    signal.SIGQUIT,
+                    signal.SIGTERM,
+                ]):
+                    signal.signal(s, sig_handler)
 
-    if options['mode'] == 'server':
-        logger.info("Listening for requests")
-        for s in set([
-            signal.SIGINT,
-            signal.SIGQUIT,
-            signal.SIGTERM,
-        ]):
-            signal.signal(s, sig_handler)
+                while not exit_run:
+                    await asyncio.sleep(1)
 
-        while not exit_run:
-            await asyncio.sleep(1)
-
-        logger.info("Execution stopped")
+                logger.info("Execution stopped")
+        finally:
+            # Mirrors transport.connect() above: whatever happens in the body
+            # (exception, signal-triggered exit, or plain fallthrough for the
+            # no-scenario client case), the server callback registered via
+            # router.activate() above must be torn down before the transport
+            # itself is disconnected below.
+            if options['mode'] in ('server', 'loopback'):
+                await router.deactivate()
+    finally:
+        # Without this, e.g. AMQPTransport leaves its underlying connection
+        # (and the reader/writer/heartbeat/reconnect tasks aio_pika runs on
+        # top of it) open when this coroutine returns. Those tasks are then
+        # still pending when the process exits, and get torn down mid-flight
+        # by the interpreter instead of shutting down cleanly - surfacing as
+        # "Task was destroyed but it is pending!" / "Event loop is closed"
+        # noise on every run, even a scenario-less one.
+        await transport.disconnect()
 
 
 def sig_handler(sig_num, stack_frame):
@@ -169,7 +187,16 @@ def main(argv):
     logging.config.dictConfig(LOGGING)
 
     loop = asyncio.new_event_loop()
-    loop.run_until_complete(aiomain(**options))
+    try:
+        loop.run_until_complete(aiomain(**options))
+    finally:
+        # A loop left open here is only closed implicitly, whenever the
+        # garbage collector gets around to it - by which point interpreter
+        # shutdown may already have torn down other state, turning any
+        # still-pending task's teardown into "Event loop is closed" /
+        # "no running event loop" errors instead of a clean cancellation.
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
 
 
 if __name__ == '__main__':
