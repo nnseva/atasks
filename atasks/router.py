@@ -392,7 +392,7 @@ class Router(object):
         logger.info('Registered %s', aioref)
         return aioref
 
-    def register_queue_task(self, name, coro=None, options={}):
+    def register_atask_queue(self, name, coro=None, options={}):
         """
         Register a fire-and-forget, competing-consumers task-queue task in the registry.
 
@@ -421,7 +421,7 @@ class Router(object):
         logger.info('Registered queue task %s', aioref)
         return aioref
 
-    def register_broadcast_task(self, name, coro=None, options={}):
+    def register_atask_broadcast(self, name, coro=None, options={}):
         """
         Register a fire-and-forget, fan-out broadcast task in the registry.
 

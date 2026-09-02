@@ -88,7 +88,7 @@ def atask_queue(coro=None, name=None, namespace='default', **options):
 
     logger.debug('atask_queue: %s[%s/%s] %s', coro, name, namespace, options)
     router = get_router(namespace)
-    return router.register_queue_task(name, coro=coro, options=options)
+    return router.register_atask_queue(name, coro=coro, options=options)
 
 
 def atask_broadcast(coro=None, name=None, namespace='default', **options):
@@ -124,4 +124,4 @@ def atask_broadcast(coro=None, name=None, namespace='default', **options):
 
     logger.debug('atask_broadcast: %s[%s/%s] %s', coro, name, namespace, options)
     router = get_router(namespace)
-    return router.register_broadcast_task(name, coro=coro, options=options)
+    return router.register_atask_broadcast(name, coro=coro, options=options)
