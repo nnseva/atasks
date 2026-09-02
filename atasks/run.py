@@ -11,9 +11,121 @@ import signal
 import sys
 
 
-logger = logging.getLogger(__name__)
+# Not logging.getLogger(__name__): this module is meant to be run as
+# `python -m atasks.run`, which makes __name__ '__main__' rather than
+# 'atasks.run' - decoupled from the 'atasks' logger hierarchy that -L/
+# --loggers (and its 'atasks' default) configures below, so every log call in
+# this file would otherwise be silently dropped by logging's lastResort
+# handler (WARNING+ only, straight to stderr) whenever actually run that way.
+logger = logging.getLogger('atasks.run')
 
 exit_run = False
+
+# Keys accepted inside one -N/--namespace SPEC (see _parse_namespace_spec).
+_NAMESPACE_SPEC_KEYS = frozenset((
+    'name', 'mode', 'transport', 'url', 'hostname',
+    'max-trace-depth', 'trace-filter-modules', 'collect-await-frames',
+))
+
+
+def _parse_namespace_spec(spec):
+    """
+    Parse one -N/--namespace command-line value.
+
+    SPEC is a comma-separated ``key=value`` list describing one namespace's
+    Transport and Router configuration, e.g.::
+
+        name=orders,mode=server,transport=amqp,url=amqp://host/,hostname=worker-1,
+        max-trace-depth=500,trace-filter-modules=atasks:backoff,collect-await-frames=false
+
+    Recognized keys:
+
+    - ``name`` (required) - namespace name
+    - ``mode`` - ``client`` or ``server``, default: ``client``. A ``server``
+      namespace has its Router activated against its Transport; a ``client``
+      namespace only connects its Transport to send requests/events/broadcasts.
+    - ``transport`` - ``loopback`` or ``amqp``, default: ``loopback``
+    - ``url`` - URL passed to the transport, e.g. the AMQP broker URL when
+      ``transport=amqp``
+    - ``hostname`` - default: auto-detected via ``socket.gethostname()``
+    - ``max-trace-depth`` - integer, default: ``1000``
+    - ``trace-filter-modules`` - ``:``-separated dotted module name prefixes,
+      default: none filtered
+    - ``collect-await-frames`` - ``true``/``false``, default: ``true``
+
+    See the Router constructor (``atasks.router.Router``) for what each of the
+    last four actually control.
+
+    :param spec: the raw -N/--namespace argument value
+    :type spec: str
+    :returns: parsed namespace options, every key present (defaulted where omitted)
+    :rtype: dict
+    :raises argparse.ArgumentTypeError: for an unknown key, a missing ``name``,
+                                         a key given twice, or an invalid value
+    """
+    raw = {}
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            raise argparse.ArgumentTypeError("expected key=value, got %r in %r" % (item, spec))
+        key, value = item.split('=', 1)
+        key = key.strip()
+        if key not in _NAMESPACE_SPEC_KEYS:
+            raise argparse.ArgumentTypeError(
+                "unknown key %r in %r, expected one of: %s" % (key, spec, ', '.join(sorted(_NAMESPACE_SPEC_KEYS)))
+            )
+        if key in raw:
+            raise argparse.ArgumentTypeError("key %r given twice in %r" % (key, spec))
+        raw[key] = value.strip()
+
+    if 'name' not in raw:
+        raise argparse.ArgumentTypeError("missing required 'name=' key in %r" % (spec,))
+
+    mode = raw.get('mode', 'client')
+    if mode not in ('client', 'server'):
+        raise argparse.ArgumentTypeError("mode must be 'client' or 'server', got %r in %r" % (mode, spec))
+
+    transport = raw.get('transport', 'loopback')
+    if transport not in ('loopback', 'amqp'):
+        raise argparse.ArgumentTypeError("transport must be 'loopback' or 'amqp', got %r in %r" % (transport, spec))
+
+    max_trace_depth = raw.get('max-trace-depth')
+    if max_trace_depth is not None:
+        try:
+            max_trace_depth = int(max_trace_depth)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "max-trace-depth must be an integer, got %r in %r" % (max_trace_depth, spec)
+            )
+
+    trace_filter_modules = raw.get('trace-filter-modules')
+    if trace_filter_modules is not None:
+        trace_filter_modules = [module for module in trace_filter_modules.split(':') if module]
+
+    collect_await_frames = raw.get('collect-await-frames')
+    if collect_await_frames is not None:
+        lowered = collect_await_frames.lower()
+        if lowered in ('true', 'yes', '1'):
+            collect_await_frames = True
+        elif lowered in ('false', 'no', '0'):
+            collect_await_frames = False
+        else:
+            raise argparse.ArgumentTypeError(
+                "collect-await-frames must be true/false, got %r in %r" % (collect_await_frames, spec)
+            )
+
+    return {
+        'name': raw['name'],
+        'mode': mode,
+        'transport': transport,
+        'url': raw.get('url'),
+        'hostname': raw.get('hostname'),
+        'max_trace_depth': max_trace_depth,
+        'trace_filter_modules': trace_filter_modules,
+        'collect_await_frames': collect_await_frames,
+    }
 
 
 async def aiomain(**options):
@@ -23,37 +135,62 @@ async def aiomain(**options):
     from atasks.transport.backends.amqp import AMQPTransport
     from atasks.transport.base import LoopbackTransport
 
-    PickleCodec()
-    kw = {}
-    if options['transport'] in ('amqp',):
-        kw = {
-            'url': options['url']
-        }
-    transport = {
-        'loopback': LoopbackTransport,
-        'amqp': AMQPTransport
-    }[options['transport']](**kw)
-    await transport.connect()
-    if options.get('hostname'):
-        # Constructing the Router ourselves, before the first get_router()
-        # call below, is what lets an explicit --hostname reach it - see the
-        # Router constructor docstring. Only done when actually requested:
-        # get_router() below is otherwise left to lazily create (or reuse) the
-        # namespace's Router exactly as before, so a namespace already set up
-        # by earlier code (its task registry included) is left untouched.
-        Router(hostname=options['hostname'])
+    # Every namespace gets its own codec, Transport and (optionally, see
+    # below) Router - namespaces are fully independent of one another (see
+    # README.md#namespaces). Doing all of this *before* any scenario module is
+    # imported matters twice over: a custom Router must exist before the
+    # first (direct or indirect) get_router() call for its namespace to take
+    # effect (see the Router constructor docstring), and every namespace needs
+    # a transport connected before its @atask/@atask_queue/@atask_broadcast
+    # decorators (imported next) can be exercised.
+    transports = {}
+    server_namespaces = []
+    for ns in options['namespaces']:
+        name = ns['name']
+        PickleCodec(namespace=name)
+
+        kw = {'namespace': name}
+        if ns['transport'] == 'amqp':
+            kw['url'] = ns['url']
+        transport = {
+            'loopback': LoopbackTransport,
+            'amqp': AMQPTransport,
+        }[ns['transport']](**kw)
+        await transport.connect()
+        transports[name] = transport
+
+        # Constructed explicitly only when at least one Router option was
+        # actually given for this namespace - otherwise get_router() below is
+        # left to lazily create (or reuse) its Router with the constructor's
+        # own defaults, so a namespace already set up by earlier code (its
+        # task registry included) is left untouched.
+        router_kwargs = {}
+        if ns['hostname'] is not None:
+            router_kwargs['hostname'] = ns['hostname']
+        if ns['max_trace_depth'] is not None:
+            router_kwargs['max_trace_depth'] = ns['max_trace_depth']
+        if ns['trace_filter_modules'] is not None:
+            router_kwargs['trace_filter_modules'] = ns['trace_filter_modules']
+        if ns['collect_await_frames'] is not None:
+            router_kwargs['collect_await_frames'] = ns['collect_await_frames']
+        if router_kwargs:
+            Router(namespace=name, **router_kwargs)
+
+        if ns['mode'] == 'server':
+            server_namespaces.append(name)
+
     try:
-        router = get_router()
-        # Scenario modules are imported here, *before* router.activate() -
-        # it's their module-level @atask/@atask_queue/@atask_broadcast
-        # decorators that populate this namespace's registries, and
-        # activate() only subscribes to names already registered at the
-        # moment it runs (registering one afterwards raises
-        # atasks.router.LateRegistration - see the Router docstrings and
-        # ATASK-NEW-ARCHITECTURE-PLAN.md). Only the coroutine objects
-        # returned by `module.aiomain(**options)` (if present) are deferred -
-        # creating a coroutine object doesn't run its body, so gathering them
-        # only after activate() below still matches the previous behaviour.
+        routers = {name: get_router(namespace=name) for name in transports}
+        # Scenario modules are imported here, *before* any router.activate()
+        # below - it's their module-level @atask/@atask_queue/@atask_broadcast
+        # decorators that populate a namespace's registries, and activate()
+        # only subscribes to names already registered at the moment it runs
+        # (registering one afterwards raises atasks.router.LateRegistration -
+        # see the Router docstrings and ATASK-NEW-ARCHITECTURE-PLAN.md). Only
+        # the coroutine objects returned by `module.aiomain(**options)` (if
+        # present) are deferred - creating a coroutine object doesn't run its
+        # body, so gathering them only after activate() below still matches
+        # the previous behaviour.
         futures = []
         for filename in options['scenario']:
             if os.path.exists(filename) and os.path.isfile(filename):
@@ -68,13 +205,13 @@ async def aiomain(**options):
             if hasattr(module, 'aiomain'):
                 futures.append(module.aiomain(**options))
 
-        if options['mode'] in ('server', 'loopback'):
-            await router.activate(transport)
+        for name in server_namespaces:
+            await routers[name].activate(transports[name])
         try:
             if futures:
                 await asyncio.gather(*futures)
 
-            if options['mode'] == 'server':
+            if server_namespaces:
                 logger.info("Listening for requests")
                 for s in set([
                     signal.SIGINT,
@@ -90,11 +227,11 @@ async def aiomain(**options):
         finally:
             # Mirrors transport.connect() above: whatever happens in the body
             # (exception, signal-triggered exit, or plain fallthrough for the
-            # no-scenario client case), the server callback registered via
-            # router.activate() above must be torn down before the transport
-            # itself is disconnected below.
-            if options['mode'] in ('server', 'loopback'):
-                await router.deactivate()
+            # no-scenario/all-client case), every server namespace's callback
+            # registered via router.activate() above must be torn down before
+            # its transport is disconnected below.
+            for name in server_namespaces:
+                await routers[name].deactivate()
     finally:
         # Without this, e.g. AMQPTransport leaves its underlying connection
         # (and the reader/writer/heartbeat/reconnect tasks aio_pika runs on
@@ -103,7 +240,8 @@ async def aiomain(**options):
         # by the interpreter instead of shutting down cleanly - surfacing as
         # "Task was destroyed but it is pending!" / "Event loop is closed"
         # noise on every run, even a scenario-less one.
-        await transport.disconnect()
+        for transport in transports.values():
+            await transport.disconnect()
 
 
 def sig_handler(sig_num, stack_frame):
@@ -116,7 +254,7 @@ def sig_handler(sig_num, stack_frame):
 
 def main(argv):
     """Module main"""
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
         'scenario',
         nargs='*',
@@ -131,16 +269,31 @@ def main(argv):
     )
 
     parser.add_argument(
-        '-U', '--url',
-        dest='url',
-        help='URL for the transport',
-    )
-
-    parser.add_argument(
-        '-H', '--hostname',
-        dest='hostname',
+        '-N', '--namespace',
+        dest='namespaces',
+        metavar='SPEC',
+        action='append',
+        type=_parse_namespace_spec,
         default=None,
-        help='Host identification recorded in atask call traces, default: auto-detected via socket.gethostname()',
+        help=("""
+Configure one namespace to run - may be given multiple times, once per
+namespace, each with its own Transport/Router setup and mode. SPEC is a
+comma-separated key=value list:
+    name                      (required) namespace name
+    mode=client|server        default: client - a 'server' namespace has its
+                            Router activated; if any namespace is 'server'
+                            the process then listens for requests until a
+                            signal arrives
+    transport=loopback|amqp   default: loopback
+    url                       for transport=amqp
+    hostname                  default: auto-detected
+    max-trace-depth           default: 1000
+    trace-filter-modules=MOD1:MOD2:...    default: none filtered
+    collect-await-frames=true|false       default: true
+
+Default when omitted entirely: a single name=default namespace.
+See README.md#commands for the full reference and examples. 
+        """),
     )
 
     parser.add_argument(
@@ -158,23 +311,20 @@ def main(argv):
         help='Logger(s) to be activated to the verbosity level, may be several, default is atasks',
     )
 
-    parser.add_argument(
-        '-M', '--mode',
-        choices=['client', 'server', 'loopback'],
-        dest='mode',
-        default='client',
-        help='Mode to be evaluated',
-    )
-
-    parser.add_argument(
-        '-T', '--transport',
-        choices=['loopback', 'amqp'],
-        dest='transport',
-        default='loopback',
-        help='Transport to be used',
-    )
     args = parser.parse_args(argv[1:])
     options = vars(args)
+
+    # No -N/--namespace at all: fall back to a single default-configured
+    # 'default' namespace (client mode, loopback transport) - the same
+    # behaviour running with zero namespace options always had.
+    if options['namespaces'] is None:
+        options['namespaces'] = [_parse_namespace_spec('name=default')]
+
+    seen = set()
+    for ns in options['namespaces']:
+        if ns['name'] in seen:
+            parser.error("namespace %r given more than once via -N/--namespace" % ns['name'])
+        seen.add(ns['name'])
 
     LOGGING = {
         'version': 1,

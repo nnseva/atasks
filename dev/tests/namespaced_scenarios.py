@@ -1,0 +1,59 @@
+"""
+Processed scenarios
+"""
+
+import asyncio
+import logging
+
+from atasks import trace
+from atasks.tasks import atask
+
+
+logger = logging.getLogger(__name__)
+
+
+@atask(namespace='one')
+async def task_one(a):
+    """Example task"""
+    logger.info("task_one starting: {}".format(a))
+    await asyncio.sleep(0.1)
+    logger.info("task_one finished: {}".format(a))
+    return a
+
+
+@atask(namespace='two')
+async def task_two(a):
+    """Another example task"""
+    logger.info("task_two starting: {}".format(a))
+    await asyncio.sleep(0.2)
+    logger.info("task_two finished: {}".format(a))
+    return a
+
+
+@atask(namespace='three')
+async def task_three(a):
+    """Yet another example task"""
+    logger.info("task_three evaluating: {}".format(a))
+    return a
+
+
+@atask
+async def request_sequence():
+    """Example task calling and processing sequence of another tasks"""
+    logger.info("request_sequence starting")
+    a = await task_one(1)
+    assert a == 1
+    a = await task_two(3)
+    assert a == 3
+    logger.info("request_sequence finished")
+
+
+@atask
+async def request_parallel():
+    """Example task calling and processing bunch of another tasks"""
+    logger.info("request_parallel starting")
+    futures = [task_one(a) for a in range(5)] + [task_two(a) for a in range(5)]
+    returns = await asyncio.gather(*futures)
+    assert returns == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+    logger.info("request_parallel finished")
+    return returns

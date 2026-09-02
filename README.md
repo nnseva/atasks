@@ -527,25 +527,63 @@ optional asynchronous `aiomain` coroutine:
 python -m atasks.run file-or-module [file-or-module ...] [options]
 ```
 
-For example, run the included scenario in loopback mode:
+Each referenced file or module is loaded once, regardless of how many
+namespaces it registers `@atask`s into (see [Namespaces](#namespaces)). If it
+defines `aiomain`, that coroutine is evaluated; parsed command-line options
+(including the parsed `-N`/`--namespace` list, see below) are passed to it as
+keyword arguments - see `dev/tests/scenarios.py` for an example.
+
+### Namespaces on the command line
+
+Every namespace the run is meant to touch - even a single one - is configured
+with its own `-N`/`--namespace SPEC`, repeatable, one per namespace. `SPEC` is
+a comma-separated `key=value` list:
+
+| Key                     | Default    | Meaning |
+|--------------------------|------------|---------|
+| `name`                   | *(required)* | Namespace name |
+| `mode`                   | `client`   | `client` - only connects the transport to send requests/events/broadcasts. `server` - additionally activates this namespace's `Router` against its transport, so it serves requests too |
+| `transport`              | `loopback` | `loopback` or `amqp` |
+| `url`                    | *(none)*   | Passed to the transport, e.g. the broker URL for `transport=amqp` |
+| `hostname`               | auto-detected | See the `Router` constructor's `hostname` |
+| `max-trace-depth`        | `1000`     | See the `Router` constructor's `max_trace_depth` |
+| `trace-filter-modules`   | none filtered | `:`-separated dotted module name prefixes - see the `Router` constructor's `trace_filter_modules` |
+| `collect-await-frames`   | `true`     | `true`/`false` - see the `Router` constructor's `collect_await_frames` |
+
+**If any configured namespace is `server`, the process activates every
+`server` namespace's `Router` and then blocks, "Listening for requests", until
+a signal (`SIGINT`/`SIGQUIT`/`SIGTERM`) arrives** - regardless of how many
+other namespaces are `client`. With every namespace `client` (including the
+default, single-namespace case below), the process runs any scenario
+`aiomain()`s to completion and returns on its own.
+
+Omitting `-N`/`--namespace` entirely is equivalent to a single
+`-N name=default` - a `client` namespace named `default` over the loopback
+transport:
 
 ```bash
-python -m atasks.run dev.tests.scenarios --mode loopback --verbosity 3
+python -m atasks.run dev.tests.scenarios --verbosity 3
 ```
 
-Each referenced file or module is loaded. If it defines `aiomain`, that
-coroutine is evaluated; parsed command-line options are passed to it as keyword
-arguments.
+A `server` namespace paired with the loopback transport lets one process act
+as both server and client for that namespace - this is what
+`dev/tests/scenarios.py`'s own `aiomain()` uses to self-test:
 
-The runner initializes the codec and transport, then runs in one of three
-modes: `server`, `client`, or `loopback`. The `loopback` mode allows the same
-process instance to act as both server and client.
+```bash
+python -m atasks.run dev.tests.scenarios -N name=default,mode=server --verbosity 3
+```
 
-Available options are:
+Several independent namespaces, each with its own transport/mode, in one
+process:
 
-- `-M`, `--mode` - execution mode: `client` (default), `server`, or `loopback`.
-- `-T`, `--transport` - transport: `loopback` (default) or `amqp`.
-- `-U`, `--url` - URL of the AMQP transport.
+```bash
+python -m atasks.run my_scenarios.py \
+    -N name=orders,mode=server,transport=amqp,url=amqp://broker/,hostname=worker-1 \
+    -N name=billing,mode=client,transport=amqp,url=amqp://broker/
+```
+
+Other options, independent of any namespace:
+
 - `-v`, `--verbosity` - logging verbosity from `0` to `4` (default `1`).
 - `-L`, `--loggers` - logger names to configure; defaults to `atasks`.
 - `-o`, `--option` - additional values made available to `aiomain` as `opt`.
@@ -556,9 +594,10 @@ Run the module with `--help` to see the complete command-line reference:
 python -m atasks.run --help
 ```
 
-Note that if you use dedicated `server` process instance, you should not use
-`loopback` transport (which is not appropriate to reach the dedicated server
-in this case). Use `amqp` (or other interprocess transport) instead.
+Note that if you use a dedicated `server` process instance reached from
+another process, you should not use the `loopback` transport for it (it never
+reaches outside its own process) - use `amqp` (or another interprocess
+transport) instead.
 
 The module naming is different slightly depending on what you use in command line,
 either file name, or module name. Use the same module naming starting server
@@ -569,9 +608,6 @@ enlisting them all in the command line.
 
 You can start several server process instances, the client will then request them
 in arbitrary order.
-
-See `dev/tests/scenarios.py` file as an example of the file which can be called
-by the `atasks.run` module.
 
 ## Inspiration
 
@@ -681,7 +717,9 @@ Router(
 )
 ```
 
-`run.py` exposes the host identification as `--hostname`/`-H`.
+`run.py` exposes these as the `hostname`, `max-trace-depth`, `trace-filter-modules`
+and `collect-await-frames` keys of its per-namespace `-N`/`--namespace SPEC` -
+see [Commands](#commands).
 
 ## When the `atask` is crashed
 

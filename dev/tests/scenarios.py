@@ -95,8 +95,18 @@ async def request_parallel():
 
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
+    default_ns = {ns['name']: ns for ns in options['namespaces']}.get('default')
 
-    if options['mode'] in ('client', 'loopback'):
+    # A 'client' namespace expects some other, already-running process to
+    # serve 'default' (e.g. over amqp) - it's safe (and the point) to call
+    # into it here. A 'server' namespace only self-calls when paired with the
+    # loopback transport: that transport only ever reaches a Router activated
+    # in this very process (see README.md#commands), so this is the one-process
+    # server-and-client combination formerly known as run.py's 'loopback' mode -
+    # for a dedicated amqp-backed server, self-calling here would be wrong.
+    is_remote_client = default_ns and default_ns['mode'] == 'client'
+    is_self_hosted_server = default_ns and default_ns['mode'] == 'server' and default_ns['transport'] == 'loopback'
+    if is_remote_client or is_self_hosted_server:
         a = await task_one(42)
         assert a == 42
 
