@@ -26,6 +26,7 @@ from atasks.router import get_router
 from atasks.tasks import atask
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import ConnectionLostError, RequestTimeoutError
+from dev.tests._amqp_cleanup import teardown_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -80,14 +81,10 @@ class AMQPRPCTest(TestCase):
     async def asyncTearDown(self):
         ns = namespaces.get(self.namespace)
         router = getattr(ns, 'router', None)
-        if router:
-            await router.deactivate()
-        for transport in (getattr(self, 'client_transport', None), getattr(self, 'server_transport', None)):
-            if transport is not None:
-                try:
-                    await transport.disconnect()
-                except Exception:
-                    pass
+        await teardown_amqp(
+            router,
+            [getattr(self, 'client_transport', None), getattr(self, 'server_transport', None)],
+        )
 
     async def test_001_round_trip(self):
         """Basic correlation_id/reply-to round trip: the client transport calls out,
@@ -277,6 +274,16 @@ class AMQPRPCTest(TestCase):
         # of real @atask calls genuinely time out over the wire before
         # backoff.on_exception on the *caller* side retries the whole call and it
         # eventually reaches the now-available worker and succeeds.
+        #
+        # Registering a new @atask requires the router to not be active (see
+        # Router.activate/LateRegistration) - deactivate the first part's
+        # activation of self.server_transport before registering
+        # becomes_available_late; nothing further needs flaky_worker_side served.
+        # teardown_amqp also deletes flaky_worker_side's durable queue and
+        # disconnects self.server_transport early (harmless - it's not used
+        # again in this test, and asyncTearDown's own cleanup is idempotent).
+        await teardown_amqp(router, [self.server_transport])
+
         late_server_transport = AMQPTransport(namespace=namespace, url=AMQP_URL, prefix=namespace, queue=namespace)
         await late_server_transport.connect()
 
@@ -298,11 +305,76 @@ class AMQPRPCTest(TestCase):
         self.assertEqual(result, 42)
 
         await activation
-        # Deactivate before disconnecting: router.deactivate() cancels the AMQP
-        # consumer through the still-live channel. Doing it in the other order
-        # (disconnect first) would leave asyncTearDown's automatic
-        # router.deactivate() trying to cancel a consumer through an already
-        # torn-down channel/connection, which hangs waiting for an RPC reply
-        # that can never arrive.
-        await get_router(namespace).deactivate()
-        await late_server_transport.disconnect()
+        # teardown_amqp deactivates (cancelling the AMQP consumer through the
+        # still-live channel) and deletes becomes_available_late's durable
+        # queue before disconnecting late_server_transport - doing it in the
+        # other order (disconnect first) would leave the deactivate/delete
+        # step trying to reach an already-torn-down channel/connection.
+        await teardown_amqp(get_router(namespace), [late_server_transport])
+
+    async def test_007_instance_without_a_handler_never_receives_or_loses_its_requests(self):
+        """Regression test for the original bug this architecture was changed to fix
+        (see ATASK-NEW-ARCHITECTURE-PLAN.md): two independent instances - modelling
+        two hosts in a heterogeneous fleet, each with its own registered @atask
+        subset - connected to the *same* broker with the *same* routing-key/queue
+        prefix. Before the per-name RPC queue fix, every instance that had called
+        ``router.activate()`` shared one mask-bound queue regardless of which
+        @atasks it had actually registered, so a request for a name only the
+        *other* instance could serve would land, roughly half the time, on an
+        instance with no handler for it - raising JobNotFound there and losing
+        the message (it was already acked off the queue before that was
+        discovered). With one queue per registered name, an instance that never
+        registered a given name is never bound to (and can never dequeue from)
+        that name's queue in the first place - so this must hold for every one
+        of many concurrent, interleaved calls, not just "most of the time".
+        """
+        shared_prefix = 'test-isolation-%s' % uuid.uuid4().hex
+        namespace_a = _fresh_namespace()
+        namespace_b = _fresh_namespace()
+        PickleCodec(namespace=namespace_a)
+        PickleCodec(namespace=namespace_b)
+
+        # Same prefix (routing-key namespace) *and* same queue-naming prefix for
+        # both instances - exactly the "one shared deployment, two differently
+        # capable hosts" scenario from the architecture plan - only the set of
+        # locally registered @atask names differs between them.
+        transport_a = AMQPTransport(namespace=namespace_a, url=AMQP_URL, prefix=shared_prefix, queue=shared_prefix)
+        transport_b = AMQPTransport(namespace=namespace_b, url=AMQP_URL, prefix=shared_prefix, queue=shared_prefix)
+        await transport_a.connect()
+        await transport_b.connect()
+
+        @atask(namespace=namespace_a, name='only_a', timeout=5)
+        async def only_a(x):
+            return ('a', x)
+
+        @atask(namespace=namespace_b, name='only_b', timeout=5)
+        async def only_b(x):
+            return ('b', x)
+
+        router_a = get_router(namespace_a)
+        router_b = get_router(namespace_b)
+        await router_a.activate(transport_a)
+        await router_b.activate(transport_b)
+        try:
+            # router_a.send_request()/router_b.send_request() publish through
+            # transport_a/transport_b respectively - both connected to the same
+            # broker/exchange/prefix, so it is genuinely irrelevant *which*
+            # instance's connection does the publishing; what matters is which
+            # instance's queue the routing key can reach.
+            #
+            # Many concurrent, interleaved calls for both names at once: with
+            # the old shared-queue bug, roughly half of the calls for a name
+            # would have been round-robined to the instance without a handler
+            # for it and lost (surfacing here as RequestTimeoutError).
+            count = 20
+            results_b_via_a = await asyncio.gather(
+                *[router_a.send_request('only_b', i, timeout=5) for i in range(count)],
+                *[router_b.send_request('only_a', i, timeout=5) for i in range(count)],
+            )
+            results_only_b = results_b_via_a[:count]
+            results_only_a = results_b_via_a[count:]
+            self.assertEqual(results_only_b, [('b', i) for i in range(count)])
+            self.assertEqual(results_only_a, [('a', i) for i in range(count)])
+        finally:
+            await teardown_amqp(router_a, [transport_a])
+            await teardown_amqp(router_b, [transport_b])

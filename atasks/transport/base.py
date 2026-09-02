@@ -28,6 +28,21 @@ class RequestTimeoutError(TimeoutError):
     """
 
 
+class UnknownRequestName(Exception):
+    """
+    Raised by :class:`LoopbackTransport` when :meth:`Transport.send_request` is
+    called for a name with no request callback currently registered for it
+    (i.e. no local ``@atask`` handles it).
+
+    This is deliberately a fast, explicit failure rather than an attempt to
+    imitate a real broker's silent "message unroutable, drop it" behaviour
+    (which would mean hanging until ``timeout`` or forever) - see the
+    ``LoopbackTransport`` class docstring. Other transports are free to behave
+    differently for the same situation; nothing in the base ``Transport``
+    contract requires this exception specifically.
+    """
+
+
 class ConnectionLostError(ConnectionError):
     """
     Raised for every RPC (``@atask``) request currently in flight when the
@@ -58,7 +73,6 @@ class Transport(object):
         """
         logger.info("Creating a transport %s in %s", self, namespace)
         self.namespace = namespace
-        self.callback = None
 
         namespaces.register(namespace, transport=self)
 
@@ -108,7 +122,7 @@ class Transport(object):
         Publish a fire-and-forget task-queue event (competing consumers pattern).
 
         Exactly one instance among all which registered a callback for the same
-        ``name`` via :meth:`register_event_callback` will process the event -
+        ``name`` via :meth:`_register_event_callback` will process the event -
         classic AMQP work-queue semantics. No response is expected or returned.
 
         :param name: name of the queue/task the event belongs to
@@ -118,7 +132,58 @@ class Transport(object):
         """
         raise NotImplementedError()
 
-    async def register_event_callback(self, name, callback):
+    async def publish_broadcast(self, name, content):
+        """
+        Publish a fan-out (broadcast/subscribe) event.
+
+        Every instance currently subscribed via
+        :meth:`_register_broadcast_callback` under the same ``name`` receives
+        its own independent copy of the event - as opposed to
+        :meth:`publish_event`, where instances compete for a single delivery.
+        No response is expected or returned.
+
+        :param name: name of the broadcast topic
+        :type name: str
+        :param content: event payload to be sent
+        :type content: bytes
+        """
+        raise NotImplementedError()
+
+    # -- Protected per-name registration methods --------------------------
+    #
+    # The four pairs below are not meant to be called directly by library
+    # users - only ``Router.activate()``/``deactivate()`` calls them, once
+    # per name known to it at activation time (see the ``Router`` docstrings
+    # and the architecture plan for why registration after ``activate()`` is
+    # no longer supported). They share one shape across all three atasks
+    # patterns: register/unregister a single name's worth of subscription,
+    # given a callback that receives the raw message content (bytes). The
+    # request pair additionally expects the callback to *return* the encoded
+    # response - the other two are pure fire-and-forget and return nothing.
+
+    async def _register_request_callback(self, name, callback):
+        """
+        Start receiving RPC (``@atask``) requests for one registered name.
+
+        :param name: name of the atask to receive requests for
+        :type name: str
+        :param callback: coroutine called with the raw request content (bytes);
+                        must return the raw encoded response (bytes)
+        :type callback: awaitable(content: bytes) -> bytes
+        """
+        raise NotImplementedError()
+
+    async def _unregister_request_callback(self, name):
+        """
+        Stop receiving RPC requests for a name registered via
+        :meth:`_register_request_callback`.
+
+        :param name: name of the atask to stop receiving requests for
+        :type name: str
+        """
+        raise NotImplementedError()
+
+    async def _register_event_callback(self, name, callback):
         """
         Register this instance as one of possibly several competing consumers
         for the named task-queue.
@@ -135,34 +200,17 @@ class Transport(object):
         """
         raise NotImplementedError()
 
-    async def unregister_event_callback(self, name):
+    async def _unregister_event_callback(self, name):
         """
         Stop consuming the named task-queue registered via
-        :meth:`register_event_callback`.
+        :meth:`_register_event_callback`.
 
         :param name: name of the queue/task to stop consuming
         :type name: str
         """
         raise NotImplementedError()
 
-    async def publish_broadcast(self, name, content):
-        """
-        Publish a fan-out (broadcast/subscribe) event.
-
-        Every instance currently subscribed via
-        :meth:`register_broadcast_callback` under the same ``name`` receives
-        its own independent copy of the event - as opposed to
-        :meth:`publish_event`, where instances compete for a single delivery.
-        No response is expected or returned.
-
-        :param name: name of the broadcast topic
-        :type name: str
-        :param content: event payload to be sent
-        :type content: bytes
-        """
-        raise NotImplementedError()
-
-    async def register_broadcast_callback(self, name, callback):
+    async def _register_broadcast_callback(self, name, callback):
         """
         Subscribe this instance to the named fan-out broadcast topic.
 
@@ -179,44 +227,15 @@ class Transport(object):
         """
         raise NotImplementedError()
 
-    async def unregister_broadcast_callback(self, name):
+    async def _unregister_broadcast_callback(self, name):
         """
         Stop and clean up the subscription registered via
-        :meth:`register_broadcast_callback`.
+        :meth:`_register_broadcast_callback`.
 
         :param name: name of the broadcast topic to unsubscribe from
         :type name: str
         """
         raise NotImplementedError()
-
-    async def register_callback(self, callback):
-        """
-        Register a callback to receive requests.
-
-        The transport may receive requests only when the callback is registered.
-
-        Can be used to override in ancestor, to avoid receiving
-        requests when the callback is not registered (yet or already).
-
-        :param callback: callback to be called on the request received,
-                        it gets a request content and returnes a response
-                        content as bytes serialized by the namespace codec
-        :type callback: awaitable(name: str, content: bytes): bytes
-        """
-        logger.info("Registering a callback for %s in %s: [%s]", self, self.namespace, callback)
-        self.callback = callback
-
-    async def unregister_callback(self):
-        """
-        Unregister previously registered callback if present
-
-        The transport may receive requests only when the callback is registered.
-
-        Can be used to override in ancestor, to avoid receiving
-        requests when the callback is not registered (yet or already).
-        """
-        logger.info("Unregistering a callback for %s in %s", self, self.namespace)
-        self.callback = None
 
 
 class LoopbackTransport(Transport):
@@ -225,17 +244,27 @@ class LoopbackTransport(Transport):
 
     Runs entirely in-process, so "competing consumers" (task-queue mode) and
     "fan-out" (broadcast mode) are modeled by which callbacks are registered on
-    *this* instance: :meth:`register_event_callback` keeps only the most
+    *this* instance: :meth:`_register_event_callback` keeps only the most
     recently registered callback per name (one deliverable per event, like a
-    real work queue), while :meth:`register_broadcast_callback` keeps every
+    real work queue), while :meth:`_register_broadcast_callback` keeps every
     registered callback per name and calls all of them (like a real fan-out).
     Useful for fast unit tests; it does not exercise real network/crash
     behaviour - use ``AMQPTransport`` against a real broker for that.
+
+    This is deliberately the simplest possible implementation of the
+    ``Transport`` contract, not a faithful in-process stand-in for
+    ``AMQPTransport``'s broker semantics - in particular, :meth:`send_request`
+    fails fast with :class:`UnknownRequestName` for a name with no registered
+    callback, rather than imitating a real broker's silent
+    "message unroutable, drop it" behaviour (which would mean hanging until
+    ``timeout`` or forever). Other ``Transport`` implementations are free to
+    behave differently in that situation.
     """
 
     def __init__(self, namespace='default'):
-        """Overriden from the base class to add event/broadcast bookkeeping."""
+        """Overriden from the base class to add request/event/broadcast bookkeeping."""
         super().__init__(namespace)
+        self._request_callbacks = {}
         self._event_callbacks = {}
         self._broadcast_callbacks = {}
 
@@ -254,17 +283,32 @@ class LoopbackTransport(Transport):
     async def send_request(self, name, content, timeout=None):
         """
         Overriden from the base class
+
+        :raises UnknownRequestName: if no callback is currently registered for ``name``
         """
         logger.info('Sending a request %s using Loopback transport', name)
+        callback = self._request_callbacks.get(name)
+        if callback is None:
+            raise UnknownRequestName(name)
         try:
             if timeout is not None:
-                return await asyncio.wait_for(self.callback(name, content), timeout=timeout)
-            return await self.callback(name, content)
+                return await asyncio.wait_for(callback(content), timeout=timeout)
+            return await callback(content)
         except asyncio.TimeoutError:
             logger.warning('Timed out waiting for a response to %s', name)
             raise RequestTimeoutError(name) from None
-        except Exception as ex:
-            logger.error('Error while calling a callback: %s', ex)
+
+    async def _register_request_callback(self, name, callback):
+        """
+        Overriden from the base class
+        """
+        self._request_callbacks[name] = callback
+
+    async def _unregister_request_callback(self, name):
+        """
+        Overriden from the base class
+        """
+        self._request_callbacks.pop(name, None)
 
     async def publish_event(self, name, content):
         """
@@ -276,13 +320,13 @@ class LoopbackTransport(Transport):
             return
         await callback(content)
 
-    async def register_event_callback(self, name, callback):
+    async def _register_event_callback(self, name, callback):
         """
         Overriden from the base class
         """
         self._event_callbacks[name] = callback
 
-    async def unregister_event_callback(self, name):
+    async def _unregister_event_callback(self, name):
         """
         Overriden from the base class
         """
@@ -299,13 +343,13 @@ class LoopbackTransport(Transport):
         for callback in callbacks:
             await callback(content)
 
-    async def register_broadcast_callback(self, name, callback):
+    async def _register_broadcast_callback(self, name, callback):
         """
         Overriden from the base class
         """
         self._broadcast_callbacks.setdefault(name, []).append(callback)
 
-    async def unregister_broadcast_callback(self, name):
+    async def _unregister_broadcast_callback(self, name):
         """
         Overriden from the base class
         """

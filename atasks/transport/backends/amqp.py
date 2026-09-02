@@ -31,22 +31,26 @@ class AMQPTransport(Transport):
     nothing else has to change - the routing keys stay just as distinct.
 
     - RPC (request/response): requests are published with routing key
-      ``<prefix>.r.<name>``; the worker queue binds ``<prefix>.r.#`` so one
-      queue serves every request name. Responses go out on a private
+      ``<prefix>.r.<name>``; one durable queue per registered ``name``
+      (``<queue>.<prefix>.r.<name>``) binds that exact key, so every instance
+      which calls :meth:`_register_request_callback` with the same ``name``
+      competes for messages off *the same* queue - and an instance with no
+      handler for a given name is never bound to (and can never dequeue from)
+      that name's queue in the first place. Responses go out on a private
       exclusive reply-to queue per transport instance, bound to its own
       (random) queue name, correlated by ``correlation_id`` - see
-      :meth:`send_request`/:meth:`register_callback`.
+      :meth:`send_request`/:meth:`_register_request_callback`.
     - task-queue (fire-and-forget, competing consumers): events are published
       with routing key ``<prefix>.e.<name>``; one shared durable queue per
-      task name binds that exact key, so every instance which calls
-      :meth:`register_event_callback` with the same ``name`` competes for
-      messages off *the same* queue - see
-      :meth:`publish_event`/:meth:`register_event_callback`.
+      task name (``<queue>.<prefix>.q.<name>``) binds that exact key, so every
+      instance which calls :meth:`_register_event_callback` with the same
+      ``name`` competes for messages off *the same* queue - see
+      :meth:`publish_event`/:meth:`_register_event_callback`.
     - broadcast/subscribe (fire-and-forget, fan-out): broadcasts are published
       with routing key ``<prefix>.b.<name>``; every subscribing instance binds
       its own exclusive, auto-delete queue to that exact key, so every
       subscribed instance gets its own copy of every message - see
-      :meth:`publish_broadcast`/:meth:`register_broadcast_callback`.
+      :meth:`publish_broadcast`/:meth:`_register_broadcast_callback`.
 
     Uses ``aio_pika.connect_robust``, so the underlying connection
     automatically reconnects (with ``reconnect_interval`` backoff) after the
@@ -78,11 +82,13 @@ class AMQPTransport(Transport):
         self.event_exchange_name = event_exchange
         self.broadcast_exchange_name = broadcast_exchange
         self.prefix = prefix
-        self.queue_name = queue
+        self.queue = queue
         self.reconnect_interval = reconnect_interval
         self.client_properties = client_properties
         self._lock = asyncio.Lock()
         self._awaiting_requests = {}
+        self._request_queues = {}
+        self._request_consumers = {}
         self._event_queues = {}
         self._event_consumers = {}
         self._broadcast_queues = {}
@@ -105,25 +111,6 @@ class AMQPTransport(Transport):
 
     # Functional method overrides
 
-    async def unregister_callback(self):
-        """Override to implement callback unregistration."""
-        await self._lock.acquire()
-        try:
-            if hasattr(self, '_queue') and hasattr(self, '_connection') and not self._connection.is_closed:
-                # Cancelling a consumer is itself an RPC round-trip through the
-                # channel - if the connection is already gone (e.g. disconnect()
-                # was called first, or the broker dropped us) this call would
-                # otherwise hang forever waiting for a reply that can never
-                # arrive. Skip it in that case: there is nothing left to cancel.
-                await self._queue.cancel(self._consumer)
-            if hasattr(self, '_queue'):
-                del self._queue
-            if hasattr(self, '_consumer'):
-                del self._consumer
-            await super().unregister_callback()
-        finally:
-            self._lock.release()
-
     async def disconnect(self):
         """Override to implement transport disconnection."""
         await self._lock.acquire()
@@ -139,6 +126,8 @@ class AMQPTransport(Transport):
             del self._broadcast_exchange
             del self._response_queue
             del self._response_consumer
+            self._request_queues.clear()
+            self._request_consumers.clear()
             self._event_queues.clear()
             self._event_consumers.clear()
             self._broadcast_queues.clear()
@@ -291,28 +280,31 @@ class AMQPTransport(Transport):
         """Called by aio_pika after the underlying connection is successfully reestablished."""
         logger.info('Reconnected transport %s', self)
 
-    async def register_callback(self, callback):
-        """Override to implement callback registration."""
+    async def _register_request_callback(self, name, callback):
+        """
+        Override to implement per-name RPC request registration.
+
+        One durable queue per registered ``name`` (``<queue>.<prefix>.r.<name>``),
+        bound to the exact routing key ``<prefix>.r.<name>`` - never a mask - so
+        an instance with no local handler for ``name`` is never a consumer of
+        that name's queue and can never dequeue a request meant for it. See the
+        class docstring and the architecture plan for why this replaced the
+        single mask-bound queue shared by every RPC name.
+        """
         await self._lock.acquire()
         try:
-            await super().register_callback(callback)
-            self._queue = await self._channel.declare_queue(
-                self.queue_name,
-                durable=True,
-            )
-            binding_key = self._request_routing_prefix + '#'
-            logger.info('Binding queue to %s', binding_key)
-            await self._queue.bind(self._request_exchange, binding_key)
+            queue_name = '%s.%s.r.%s' % (self.queue, self.prefix, name)
+            queue = await self._channel.declare_queue(queue_name, durable=True)
+            await queue.bind(self._request_exchange, self._request_routing_prefix + name)
 
             async def _on_message(message):
                 async with message.process():
                     info = message.info()
                     request = message.body
-                name = info['routing_key'][len(self._request_routing_prefix):]
                 correlation_id = info['correlation_id']
                 logger.info('Got request for %s[%s]', name, correlation_id)
                 try:
-                    response = await self.callback(name, request)
+                    response = await callback(request)
                 except Exception:
                     # TODO: should the exception here be propagated back to the caller?
                     logger.exception('Unhandled error handling request for %s[%s]', name, correlation_id)
@@ -335,10 +327,29 @@ class AMQPTransport(Transport):
                     # connection just died, don't leave those hanging either.
                     self._fail_awaiting_requests(exc)
 
-            self._consumer = await self._queue.consume(_on_message)
+            consumer_tag = await queue.consume(_on_message)
+            self._request_queues[name] = queue
+            self._request_consumers[name] = consumer_tag
         finally:
             self._lock.release()
-        logger.info('Callback registered %s', callback)
+        logger.info('Request callback registered for %s', name)
+
+    async def _unregister_request_callback(self, name):
+        """Override to implement per-name RPC request unregistration."""
+        await self._lock.acquire()
+        try:
+            queue = self._request_queues.pop(name, None)
+            consumer_tag = self._request_consumers.pop(name, None)
+            if queue is not None and consumer_tag is not None and hasattr(self, '_connection') \
+                    and not self._connection.is_closed:
+                # Cancelling a consumer is itself an RPC round-trip through the
+                # channel - if the connection is already gone (e.g. disconnect()
+                # was called first, or the broker dropped us) this call would
+                # otherwise hang forever waiting for a reply that can never
+                # arrive. Skip it in that case: there is nothing left to cancel.
+                await queue.cancel(consumer_tag)
+        finally:
+            self._lock.release()
 
     async def send_request(self, name, content, timeout=None):
         """Override to implement sending a request."""
@@ -401,7 +412,7 @@ class AMQPTransport(Transport):
         Override to publish an event.
 
         Publishes to ``event_exchange`` with routing key ``<prefix>.e.<name>``.
-        Every instance which calls :meth:`register_event_callback` with the
+        Every instance which calls :meth:`_register_event_callback` with the
         same ``name`` binds *the same* durable queue to that exact key, so
         they compete for each message. Note this means a message published
         before any consumer has ever registered for ``name`` - so no queue is
@@ -428,11 +439,11 @@ class AMQPTransport(Transport):
         finally:
             self._lock.release()
 
-    async def register_event_callback(self, name, callback):
+    async def _register_event_callback(self, name, callback):
         """Override to register an event callback."""
         await self._lock.acquire()
         try:
-            queue_name = '%s.q.%s' % (self.prefix, name)
+            queue_name = '%s.%s.q.%s' % (self.queue, self.prefix, name)
             queue = await self._channel.declare_queue(queue_name, durable=True)
             await queue.bind(self._event_exchange, self._event_routing_prefix + name)
 
@@ -450,7 +461,7 @@ class AMQPTransport(Transport):
         finally:
             self._lock.release()
 
-    async def unregister_event_callback(self, name):
+    async def _unregister_event_callback(self, name):
         """Override to unregister an event callback."""
         await self._lock.acquire()
         try:
@@ -470,7 +481,7 @@ class AMQPTransport(Transport):
 
         Publishes to ``broadcast_exchange`` with routing key
         ``<prefix>.b.<name>``. Every instance which calls
-        :meth:`register_broadcast_callback` with the same ``name`` binds its
+        :meth:`_register_broadcast_callback` with the same ``name`` binds its
         own exclusive, auto-delete queue to that exact key, so every
         subscribed instance receives its own copy of every message.
         """
@@ -494,7 +505,7 @@ class AMQPTransport(Transport):
         finally:
             self._lock.release()
 
-    async def register_broadcast_callback(self, name, callback):
+    async def _register_broadcast_callback(self, name, callback):
         """Override to register a broadcast callback."""
         await self._lock.acquire()
         try:
@@ -515,7 +526,7 @@ class AMQPTransport(Transport):
         finally:
             self._lock.release()
 
-    async def unregister_broadcast_callback(self, name):
+    async def _unregister_broadcast_callback(self, name):
         """Override to unregister a broadcast callback."""
         await self._lock.acquire()
         try:

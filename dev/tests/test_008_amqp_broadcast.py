@@ -19,6 +19,7 @@ from atasks.codecs import PickleCodec
 from atasks.router import get_router
 from atasks.tasks import atask_broadcast
 from atasks.transport.backends.amqp import AMQPTransport
+from dev.tests._amqp_cleanup import teardown_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -47,11 +48,11 @@ class AMQPBroadcastTest(TestCase):
         self._cleanup_transports = []
 
     async def asyncTearDown(self):
-        for transport in self._cleanup_transports:
-            try:
-                await transport.disconnect()
-            except Exception:
-                pass
+        # Broadcast subscriptions are exclusive/auto-delete (see AMQPTransport)
+        # and clean themselves up on disconnect - teardown_amqp is still used
+        # here for consistency and to cover any @atask/@atask_queue this file
+        # might grow in the future.
+        await teardown_amqp(None, self._cleanup_transports)
 
     async def _new_transport(self, **kw):
         transport = AMQPTransport(namespace=self.namespace, url=AMQP_URL, prefix=self.namespace, **kw)
@@ -82,7 +83,7 @@ class AMQPBroadcastTest(TestCase):
             done.set()
 
         router = get_router(namespace)
-        await router.activate_broadcast(task_name, transport)
+        await router.activate(transport)
         # give the exclusive queue's binding a moment to take effect before publishing
         await asyncio.sleep(0.2)
 
@@ -114,7 +115,7 @@ class AMQPBroadcastTest(TestCase):
                     bucket.append(content.decode())
                 return _handle
 
-            await transport.register_broadcast_callback(name, _make_handler(bucket))
+            await transport._register_broadcast_callback(name, _make_handler(bucket))
             subscribers.append(transport)
 
         # exclusive queues need a beat to be declared/bound before publishing
@@ -152,7 +153,7 @@ class AMQPBroadcastTest(TestCase):
         async def _handle(content):
             received.append(content.decode())
 
-        await transport.register_broadcast_callback(name, _handle)
+        await transport._register_broadcast_callback(name, _handle)
         await asyncio.sleep(0.3)
 
         await publisher.publish_broadcast(name, b'after-subscription')
