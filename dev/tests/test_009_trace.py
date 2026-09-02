@@ -15,6 +15,7 @@ from atasks.router import Router, get_router
 from atasks.tasks import atask, atask_broadcast, atask_queue
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import LoopbackTransport
+from dev.tests._amqp_cleanup import teardown_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -404,9 +405,7 @@ class AMQPTraceTest(TestCase):
             with self.assertRaises(ValueError) as ctx:
                 await root(1)
         finally:
-            await router.deactivate()
-            await client_transport.disconnect()
-            await server_transport.disconnect()
+            await teardown_amqp(router, [client_transport, server_transport])
 
         info = trace.get_trace(ctx.exception)
         self.assertIsNotNone(info)

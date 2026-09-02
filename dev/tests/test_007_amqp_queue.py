@@ -17,6 +17,7 @@ from atasks.codecs import PickleCodec
 from atasks.router import get_router
 from atasks.tasks import atask_queue
 from atasks.transport.backends.amqp import AMQPTransport
+from dev.tests._amqp_cleanup import teardown_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -45,11 +46,7 @@ class AMQPQueueTest(TestCase):
         self._cleanup_transports = []
 
     async def asyncTearDown(self):
-        for transport in self._cleanup_transports:
-            try:
-                await transport.disconnect()
-            except Exception:
-                pass
+        await teardown_amqp(None, self._cleanup_transports)
 
     async def _new_transport(self, **kw):
         transport = AMQPTransport(namespace=self.namespace, url=AMQP_URL, prefix=self.namespace, **kw)

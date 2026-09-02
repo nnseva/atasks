@@ -34,6 +34,7 @@ import aio_pika
 
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import ConnectionLostError, RequestTimeoutError
+from dev.tests._amqp_cleanup import teardown_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -73,11 +74,7 @@ class AMQPCoverageTest(TestCase):
         self._cleanup_transports = []
 
     async def asyncTearDown(self):
-        for transport in self._cleanup_transports:
-            try:
-                await transport.disconnect()
-            except Exception:
-                pass
+        await teardown_amqp(None, self._cleanup_transports)
 
     async def _new_transport(self, **kw):
         transport = AMQPTransport(namespace=self.namespace, url=AMQP_URL, prefix=self.namespace, **kw)
