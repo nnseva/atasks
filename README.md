@@ -45,10 +45,86 @@ from atasks.codecs import PickleCodec
         await router.activate(transport)
 ```
 
+## Namespaces
+
+All objects of the `atasks` package may be instantiated in separate namespaces. The default namespace has a name `"default"`.
+
+Use the `namespace` parameter of any `atasks` class constructor to identiy the namespace where this instance should be instantiated.
+
+The `namespace` parameter may be used in `atask` decorators to identify, in which namespace the `atask` is registered.
+
+The `get_route`, `get_transport`, or `get_codec` functions always return namespace-specific route, transport, and codec instances. Use the `namespace` parameter to select, for which namespace you want to get the instance.
+
+One namespace is completely separated from anoher. Every namespace uses it's own set of router, transport, and codec, so init them separately for every namespace which is used in your application.
+
+You can await atask declared in one namespace, from another.
+
+```python
+@atask(namespace='one')
+async def some_task():
+    await some_other_task()
+    ...
+
+@atask(namespace='other')
+async def some_other_task():
+    ....
+```
+
+### Router
+
+Router determines a way how the reference looks like, how it is awaited,
+what data are passed over the network, etc. Router is a core of the ATasks package.
+
+The `atasks.router.Router` is an only default router implementation.
+
+#### Router instance
+
+Every namespace has it's own single `Router` instance.
+
+You can create a `Router` instance with non-default constructor parameters if necessary. This should be done *before any call* to other `atasks` parts, including decorators (i.e. even before import of modules which use these decorators).
+
+Creating a Router instance immediately registers this instance in the namespace.
+
+The `Router` constructor parameters are:
+
+- `namespace` - name of the namespace (see [Namespaces](#namespaces)). The default namespace has a name `"default"`.
+- `hostname` - name of the host. You can identify your host explicitly to have this name in traces (see [How to track atask](#how-to-track-atask)). The default hostname is provided by the system.
+- `max_trace_depth` - maximum trace depth (number of recursive `atask` calls), default is 1000 (see [How to track atask](#how-to-track-atask)). If the trace is deeper, a special exception will be thrown.
+- `collect_await_frames` - whether to collect "usual" await frames between `atask` calls in the trace (see [How to track atask](#how-to-track-atask)), default is `True`.  
+
+User can also inherit `atasks.router.Router` and create an own
+router implementation if necessary. Create your own instance of the `Router` successor *before any call* to other `atasks` parts, including decorators (i.e. before import of modules which use these decorators).
+
+#### Get the namespace router instance
+
+The `get_router()` function returns the namecpase's `Router` instance.
+
+In many cases, you don't need to create your own `Router` instance. The first `get_router()` call will create the default instance of the `Router` for the correspondent namespace, if the instance is not exist at this time. All other calls of the `get_router()` to the same namespace will return the same instance.
+
+Use the `get_router()` function everywhere the instance of the `Router` is required.
+
+```python
+from atasks.router import get_router
+
+...
+    router = get_router()
+```
+
+Every namespace has it's own `Router` instance. Use the namespace name as an argument to get namespace-specific `Router` instance:
+
+```python
+from atasks.router import get_router
+
+...
+    router = get_router(namespace='my-specific-namespace')
+```
+
 ### Codec
 
 Codec determines a way to encode and decode objects passed through the network.
 It should support as many types as it can.
+
+#### PickleCodec
 
 The `atasks.codecs.PickleCodec` provided by the package uses standard python `pickle` package.
 It is universal but not always safe solution.
@@ -74,6 +150,8 @@ class MyCodec(Codec):
 
 To activate a codec, yu need just create an instance of it. The codec is installed
 into the system while construction.
+
+Every namespace has it's own codec instance. Use the namespace codec constructor parameter to register the codec in the non-default namespace.
 
 ### Transport
 
@@ -108,10 +186,9 @@ created instance should be awaited.
 
 Other transport kinds may be implemented later.
 
-`AMQPTransport` is built entirely on `aio_pika` (never on `pika` or another
-AMQP client) - the whole project is expected to standardize on this one
-AMQP client library, so `aio_pika` itself should never need to be imported
-directly from application code. Notable constructor options:
+#### AMQP Transport
+
+`AMQPTransport` is built entirely on `aio_pika`. Notable constructor options:
 
 - `url` - the AMQP broker URL (default `amqp://localhost/`).
 - `reconnect_interval` - seconds between reconnection attempts after the
@@ -126,6 +203,8 @@ directly from application code. Notable constructor options:
 
 See "Request timeout and combining `@atask` with `backoff`" below for how
 `AMQPTransport` surfaces RPC timeouts and connection loss to the caller.
+
+#### Creating your own transport implementation
 
 User can inherit `atasks.transport.base.Transport` as a base class and create an own
 transport implementation. Just replace all methods generating `NotImplementedError`. Note that
@@ -144,55 +223,62 @@ class MyTransport(Transport):
 
     async def send_request(self, name, content):
         ...
-```
 
-### Router
+    async def publish_event(self, name, content):
+        ...
 
-Router determines a way how the reference looks like, how it is awaited,
-what data are passed over the network etc. Router is a core of the ATasks package.
+    async def publish_broadcast(self, name, content):
+        ...
 
-The `atasks.router.Router` is an only default router implementation.
+    async def register_callback(self, callback):
+        ...
 
-User can inherit `atasks.router.Router` and create an own
-router implementation if necessary.
+    async def register_event_callback(self, name, callback):
+        ...
 
-As a rule, you don't need to do it. In this case, you can just
-use `get_router()` function to get a default router instance.
+    async def register_broadcast_callback(self, name, callback):
+        ...
 
-```python
-from atasks.router import get_router
+    async def unregister_callback(self):
+        ...
 
-...
-    router = get_router()
+    async def unregister_event_callback(self, name):
+        ...
+
+    async def unregister_broadcast_callback(self, name):
+        ...
+
+
 ```
 
 ### Client and Server
 
-If your application should send requests only, no any
-other actions required on the initialization stage.
+The transport determines, what the role is your application instance plays: client or server.
 
-Server application which listens to events should
-also activate a transport to receive requests:
+If your application instance is a client, requesting other instances through the `atask`, you need to only `connect` the transport.
 
+If your application is a server, listening to atask requests, events, and broadcasts, you also need to `activate` the transport on the `Router` instance.
+
+*Client Application*:
 ```python
-    server = AMQPTransport()
-
-    ...
-    router = get_router()
-    await router.activate(server)
+    transport = AMQPTransport()
+    await transport.connect()
 ```
 
+*Server Application*:
+```python
+    transport = AMQPTransport()
+    await transport.connect()
 
+    router = get_router()
+    await router.activate(transport)
+```
 
 ## Markup an asynchronous distributed task
 
-Decorator `atasks.tasks.atask` is used to markup the asynchronous coroutine
-(or even synchronous returning `future` object) as an asynchronous distributed
-task.
+Decorator `atasks.tasks.atask` is used to markup the asynchronous coroutine (or even synchronous returning `future` object) as an asynchronous distributed task.
 
-Note that the first call to the wrapper creates a default router. You should
-create your own Router (or ancestor) instance before the first call
-to the wrapper if necessary.
+Note that the first call to the wrapper creates a default router. You should create your own Router (or ancestor) instance before the first call to the wrapper if necessary.
 
 ```python
 @atask
@@ -202,9 +288,7 @@ async def some_task(a):
 
 Client and server should use the same module defining `atask`s as a rule.
 
-In order to await `atask` the `atask` name is used. Default name is determined
-by the coroutine name and containing module. You can replace a default name
-using additional `name` parameter of the decorator:
+In order to await `atask` the `atask` name is used. Default name is determined by the coroutine name and containing module. You can replace a default name using additional `name` parameter of the decorator:
 
 ```python
 @atask(name="some_other_name")
@@ -212,13 +296,13 @@ async def some_task(a):
     ...
 ```
 
-Both bare (`@atask`) and parameterized (`@atask(...)`) forms work, and so do
-the equivalent forms of `@atask_queue` and `@atask_broadcast` described below.
+The `name` influences the network name used to identify the `atask` when it is requested.
+
+Both bare (`@atask`) and parameterized (`@atask(...)`) forms work, and so do the equivalent forms of `@atask_queue` and `@atask_broadcast` described below.
 
 ## Awaiting evaluation of the asynchronous distributed task
 
-The `atask` is awaited as a usual coroutine. You can use `await` keyword, or
-get a `future` calling `atask` synchronously and control future using `asyncio` module.
+The `atask` is awaited as a usual coroutine. You can use `await` keyword, or get a `future` calling `atask` synchronously and control future using `asyncio` module.
 
 
 ```python
@@ -404,35 +488,6 @@ every function registered with `@atask` should be safe to run more than once
 for the same logical input. For `@atask_queue`/`@atask_broadcast`, surviving
 a crash mid-processing is the handler's own responsibility to design for, if
 the use case needs it at all - the delivery mechanism itself won't help.
-
-## Namespaces
-
-Objects may be instantiated in separate namespaces. Just
-pass an additional `namespace=...` parameter to:
-
-- constructor of codec, transport, or route object
-- atask decorator
-- `get_route`, `get_transport`, or `get_codec` function
-
-One namespace is completely separated from anoher. Every
-namespace uses it's own set of router, transport, and codec,
-so init them separately for every namespace which is used
-in your application.
-
-The default namespace has a name `default`.
-
-You can await task from one namespace in another.
-
-```python
-@atask(namespace='one')
-async def some_task():
-    await some_other_task()
-    ...
-
-@atask(namespace='other')
-async def some_other_task():
-    ....
-```
 
 ## Commands
 
