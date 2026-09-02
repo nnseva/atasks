@@ -36,6 +36,22 @@ class TransportError(Exception):
     pass
 
 
+class LateRegistration(Exception):
+    """
+    An ``@atask``/``@atask_queue``/``@atask_broadcast`` was registered after
+    :meth:`Router.activate` had already been called for this namespace.
+
+    ``activate()`` subscribes, once, to exactly the names known to it at that
+    moment - a name registered afterwards would never get its queue bound,
+    and (with the previous mask-bound single RPC queue) could silently steal
+    messages meant for another instance instead. Registration order is
+    therefore enforced instead of silently tolerated: load every module that
+    registers atasks this instance should serve, then call ``activate()`` -
+    never the other way round.
+    """
+    pass
+
+
 class Router(object):
     """
     Router is a core atasks class which registers asynchronous tasks,
@@ -88,9 +104,22 @@ class Router(object):
         :type collect_await_frames: bool
         """
         logger.info("Creating a router for %s", namespace)
-        namespaces.register(namespace, router=self, registry=Manager(namespace, unite=False))
+        namespaces.register(
+            namespace,
+            router=self,
+            # Three independent registries, one per atask kind, rather than a
+            # single shared one keyed only by name: `activate()` needs to
+            # enumerate "every currently registered RPC name" (etc.)
+            # separately per kind, to subscribe each kind the right way -
+            # see `activate()`/`_activate_request()`/`_activate_queue()`/
+            # `_activate_broadcast()` below.
+            rpc_registry=Manager(namespace, unite=False),
+            queue_registry=Manager(namespace, unite=False),
+            broadcast_registry=Manager(namespace, unite=False),
+        )
         self.namespace = namespace
         self.server = None
+        self._activated = {'rpc': [], 'queue': [], 'broadcast': []}
         self.hostname = hostname if hostname is not None else socket.gethostname()
         self.max_trace_depth = max_trace_depth
         self.trace_filter_modules = tuple(trace_filter_modules or ())
@@ -100,30 +129,95 @@ class Router(object):
         """
         Activate a server transport.
 
-        The server transport will be used to receive requests.
+        Subscribes, once, to every atask/atask_queue/atask_broadcast name
+        currently registered in this namespace - the transport ends up with
+        one subscription per registered name (see
+        :meth:`atasks.transport.base.Transport._register_request_callback`
+        and its event/broadcast counterparts), never a single catch-all
+        subscription for every possible name.
 
-        The server's `register_callback` will be called to register a router callback.
+        Registering a new atask/atask_queue/atask_broadcast after this call
+        is no longer supported - see :class:`LateRegistration`. Load every
+        module that registers atasks this instance should serve *before*
+        calling ``activate()``.
+
+        :param server: transport to receive requests/events/broadcasts from
+        :type server: atasks.transport.base.Transport or None
         """
         logger.info('Activating %s for the router of %s', server, self.namespace)
         if self.server == server:
             return
         if self.server:
-            await self.server.unregister_callback()
+            await self.deactivate()
         self.server = server
-        if self.server:
-            await self.server.register_callback(self._on_request)
+        if not self.server:
+            return
+
+        ns = namespaces.get(self.namespace)
+        names = {
+            'rpc': ns.rpc_registry.names(),
+            'queue': ns.queue_registry.names(),
+            'broadcast': ns.broadcast_registry.names(),
+        }
+        for name in names['rpc']:
+            await self._activate_request(name)
+        for name in names['queue']:
+            await self._activate_queue(name)
+        for name in names['broadcast']:
+            await self._activate_broadcast(name)
+        # Recorded so that `deactivate()` unregisters exactly what was
+        # activated here, regardless of whatever the registries hold by then.
+        self._activated = names
 
     async def deactivate(self):
         """
-        Deactivate a server transport.
+        Deactivate the current server transport.
 
-        The server's `unregister_callback` will be called to unregister
-        a router callback.
+        Unregisters exactly the names activated by the last :meth:`activate`
+        call (rather than re-reading the registries, which should - but,
+        strictly, are not guaranteed to - still hold the same names).
         """
         logger.info('Deactivating %s', self.server)
-        if self.server:
-            await self.server.unregister_callback()
+        if not self.server:
+            return
+        for name in self._activated['rpc']:
+            await self._deactivate_request(name)
+        for name in self._activated['queue']:
+            await self._deactivate_queue(name)
+        for name in self._activated['broadcast']:
+            await self._deactivate_broadcast(name)
+        self._activated = {'rpc': [], 'queue': [], 'broadcast': []}
         self.server = None
+
+    async def _activate_request(self, name):
+        """Protected: subscribe the current server to RPC requests for one name."""
+        async def _callback(content):
+            return await self._on_request(name, content)
+        await self.server._register_request_callback(name, _callback)
+
+    async def _deactivate_request(self, name):
+        """Protected: undo :meth:`_activate_request` for one name."""
+        await self.server._unregister_request_callback(name)
+
+    async def _activate_queue(self, name):
+        """Protected: subscribe the current server to a task-queue's events for one name."""
+        async def _callback(content):
+            await self._on_event(name, content)
+        await self.server._register_event_callback(name, _callback)
+
+    async def _deactivate_queue(self, name):
+        """Protected: undo :meth:`_activate_queue` for one name."""
+        await self.server._unregister_event_callback(name)
+
+    async def _activate_broadcast(self, name):
+        """Protected: subscribe the current server to a broadcast topic for one name."""
+        async def _callback(content):
+            await self._on_broadcast(name, content)
+        await self.server._register_broadcast_callback(name, _callback)
+
+    async def _deactivate_broadcast(self, name):
+        """Protected: undo :meth:`_activate_broadcast` for one name."""
+        await self.server._unregister_broadcast_callback(name)
 
     async def send_request(self, name, *argv, timeout=None, trace_chain=(), **kwargs):
         """
@@ -172,10 +266,10 @@ class Router(object):
 
     async def send_event(self, name, *argv, trace_chain=(), **kwargs):
         """
-        Publish a fire-and-forget task-queue event (see :meth:`register_queue_task`).
+        Publish a fire-and-forget task-queue event (see :meth:`register_atask_queue`).
 
         Exactly one competing consumer instance among all currently subscribed via
-        :meth:`activate_queue` will process it. No result is returned to the caller -
+        :meth:`activate` will process it. No result is returned to the caller -
         the call resolves as soon as the event is handed off to the transport.
 
         :param name: name of the queue/task
@@ -202,7 +296,7 @@ class Router(object):
         """
         Publish a fan-out event (see :meth:`register_broadcast_task`).
 
-        Every instance currently subscribed via :meth:`activate_broadcast` under the
+        Every instance currently subscribed via :meth:`activate` under the
         same name receives and processes its own copy. No result is returned to the
         caller - the call resolves as soon as the event is handed off to the transport.
 
@@ -249,7 +343,7 @@ class Router(object):
             raise NoCodecRegistered()
 
         argv, kwargs, trace_chain = await codec.decode(content)
-        item = namespaces.get(self.namespace).registry.get(name)
+        item = namespaces.get(self.namespace).rpc_registry.get(name)
         if not item:
             raise JobNotFound(name)
 
@@ -288,7 +382,7 @@ class Router(object):
             raise NoCodecRegistered()
 
         argv, kwargs, trace_chain = await codec.decode(content)
-        item = namespaces.get(self.namespace).registry.get(name)
+        item = namespaces.get(self.namespace).queue_registry.get(name)
         if not item:
             raise JobNotFound(name)
 
@@ -321,7 +415,7 @@ class Router(object):
             raise NoCodecRegistered()
 
         argv, kwargs, trace_chain = await codec.decode(content)
-        item = namespaces.get(self.namespace).registry.get(name)
+        item = namespaces.get(self.namespace).broadcast_registry.get(name)
         if not item:
             raise JobNotFound(name)
 
@@ -375,10 +469,14 @@ class Router(object):
         :type options: dict
         :returns: network reference stub to await atask remotely
         :rtype: awaitable
+        :raises LateRegistration: if :meth:`activate` was already called for this namespace
         """
+        if self.server is not None:
+            raise LateRegistration(name)
+
         namespace = self.namespace
 
-        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+        namespaces.get(namespace).rpc_registry.register(name, coro=coro, options=options)
         default_timeout = options.get('timeout')
 
         async def aioref(*argv, **kwargs):
@@ -408,10 +506,14 @@ class Router(object):
         :type options: dict
         :returns: network reference stub used to publish the event remotely
         :rtype: awaitable
+        :raises LateRegistration: if :meth:`activate` was already called for this namespace
         """
+        if self.server is not None:
+            raise LateRegistration(name)
+
         namespace = self.namespace
 
-        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+        namespaces.get(namespace).queue_registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
             chain = trace.push_hop(self, name, namespace, 'queue')
@@ -437,10 +539,14 @@ class Router(object):
         :type options: dict
         :returns: network reference stub used to publish the event remotely
         :rtype: awaitable
+        :raises LateRegistration: if :meth:`activate` was already called for this namespace
         """
+        if self.server is not None:
+            raise LateRegistration(name)
+
         namespace = self.namespace
 
-        namespaces.get(namespace).registry.register(name, coro=coro, options=options)
+        namespaces.get(namespace).broadcast_registry.register(name, coro=coro, options=options)
 
         async def aioref(*argv, **kwargs):
             chain = trace.push_hop(self, name, namespace, 'broadcast')
@@ -449,77 +555,6 @@ class Router(object):
         aioref.__qualname__ = 'broadcast[%s/%s]' % (name, namespace)
         logger.info('Registered broadcast task %s', aioref)
         return aioref
-
-    async def activate_queue(self, name, transport=None):
-        """
-        Start consuming the named task-queue as one of possibly several competing
-        consumer instances.
-
-        :param name: name of the task-queue task, as passed to ``atask_queue``
-        :type name: str
-        :param transport: transport to consume from, defaults to this namespace's
-                          registered transport
-        :type transport: atasks.transport.base.Transport or None
-        """
-        transport = transport or get_transport(self.namespace)
-        if not transport:
-            raise NoClientTransportRegistered()
-
-        async def _callback(content):
-            await self._on_event(name, content)
-
-        await transport.register_event_callback(name, _callback)
-
-    async def deactivate_queue(self, name, transport=None):
-        """
-        Stop consuming the named task-queue previously activated with :meth:`activate_queue`.
-
-        :param name: name of the task-queue task
-        :type name: str
-        :param transport: transport to stop consuming from, defaults to this namespace's
-                          registered transport
-        :type transport: atasks.transport.base.Transport or None
-        """
-        transport = transport or get_transport(self.namespace)
-        if transport:
-            await transport.unregister_event_callback(name)
-
-    async def activate_broadcast(self, name, transport=None):
-        """
-        Subscribe to the named fan-out broadcast topic.
-
-        This instance receives its own independent copy of every event published
-        under ``name``, regardless of how many other instances are also subscribed.
-
-        :param name: name of the broadcast topic, as passed to ``atask_broadcast``
-        :type name: str
-        :param transport: transport to subscribe on, defaults to this namespace's
-                          registered transport
-        :type transport: atasks.transport.base.Transport or None
-        """
-        transport = transport or get_transport(self.namespace)
-        if not transport:
-            raise NoClientTransportRegistered()
-
-        async def _callback(content):
-            await self._on_broadcast(name, content)
-
-        await transport.register_broadcast_callback(name, _callback)
-
-    async def deactivate_broadcast(self, name, transport=None):
-        """
-        Unsubscribe from the named broadcast topic previously activated with
-        :meth:`activate_broadcast`.
-
-        :param name: name of the broadcast topic
-        :type name: str
-        :param transport: transport to unsubscribe from, defaults to this namespace's
-                          registered transport
-        :type transport: atasks.transport.base.Transport or None
-        """
-        transport = transport or get_transport(self.namespace)
-        if transport:
-            await transport.unregister_broadcast_callback(name)
 
 
 def get_router(namespace='default'):

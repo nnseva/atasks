@@ -7,11 +7,12 @@ code a typo (_task_was_register_callactually_cancelled, caught by review, not
 by any test) can hide in silently: it lives inside an `except` clause that no
 existing test ever entered.
 
-Uses the raw AMQPTransport API directly (register_callback/send_request,
-register_event_callback/publish_event, register_broadcast_callback/
-publish_broadcast) rather than @atask/@atask_queue/@atask_broadcast, for
-precise control over each scenario - the same style dev/tests/
-test_007_amqp_queue.py and test_008_amqp_broadcast.py already use.
+Uses the raw AMQPTransport API directly (_register_request_callback/
+send_request, _register_event_callback/publish_event,
+_register_broadcast_callback/publish_broadcast) rather than
+@atask/@atask_queue/@atask_broadcast, for precise control over each
+scenario - the same style dev/tests/test_007_amqp_queue.py and
+test_008_amqp_broadcast.py already use.
 
 Requires a reachable RabbitMQ (or other AMQP 0-9-1 broker) at ATASKS_TEST_AMQP_URL
 (default amqp://guest:guest@localhost/), with its management plugin enabled at
@@ -250,13 +251,13 @@ class AMQPCoverageTest(TestCase):
 
         calls = {'n': 0}
 
-        async def handler(name, request):
+        async def handler(request):
             calls['n'] += 1
             if calls['n'] == 1:
                 raise ValueError('boom')
             return b'ok'
 
-        await server.register_callback(handler)
+        await server._register_request_callback('whatever', handler)
 
         with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
             with self.assertRaises(RequestTimeoutError):
@@ -282,7 +283,7 @@ class AMQPCoverageTest(TestCase):
             received.append(content)
             got_second.set()
 
-        await worker.register_event_callback(name, handler)
+        await worker._register_event_callback(name, handler)
 
         with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
             await publisher.publish_event(name, b'first')
@@ -306,7 +307,7 @@ class AMQPCoverageTest(TestCase):
             received.append(content)
             got_second.set()
 
-        await subscriber.register_broadcast_callback(name, handler)
+        await subscriber._register_broadcast_callback(name, handler)
         # give the exclusive queue's binding a moment to actually land before
         # publishing - unlike task-queue's durable queue, there is no
         # "published before any subscriber" redelivery safety net here.
@@ -338,10 +339,10 @@ class AMQPCoverageTest(TestCase):
         server = await self._new_transport(queue=self.namespace)
         client = await self._new_transport()
 
-        async def handler(name, request):
+        async def handler(request):
             return b'ok'
 
-        await server.register_callback(handler)
+        await server._register_request_callback('whatever', handler)
 
         original_publish = server._response_exchange.publish
 
@@ -372,11 +373,11 @@ class AMQPCoverageTest(TestCase):
 
         release = asyncio.Event()
 
-        async def slow_handler(name, request):
+        async def slow_handler(request):
             await release.wait()
             return b'too-late'
 
-        await server.register_callback(slow_handler)
+        await server._register_request_callback('whatever', slow_handler)
 
         with self.assertRaises(RequestTimeoutError):
             await client.send_request('whatever', b'1', timeout=1)
@@ -393,7 +394,7 @@ class AMQPCoverageTest(TestCase):
     # -- unregister paths dev/tests never otherwise exercises --
 
     async def test_011_unregister_broadcast_callback_full_lifecycle(self):
-        """register_broadcast_callback + unregister_broadcast_callback: after
+        """_register_broadcast_callback + _unregister_broadcast_callback: after
         unregistering, further broadcasts must not reach the old handler."""
         name = 'coverage.broadcast.unregister'
         publisher = await self._new_transport()
@@ -404,7 +405,7 @@ class AMQPCoverageTest(TestCase):
         async def handler(content):
             received.append(content)
 
-        await subscriber.register_broadcast_callback(name, handler)
+        await subscriber._register_broadcast_callback(name, handler)
         await asyncio.sleep(0.3)
         await publisher.publish_broadcast(name, b'before-unregister')
         for _ in range(20):
@@ -413,7 +414,7 @@ class AMQPCoverageTest(TestCase):
             await asyncio.sleep(0.1)
         self.assertEqual(received, [b'before-unregister'])
 
-        await subscriber.unregister_broadcast_callback(name)
+        await subscriber._unregister_broadcast_callback(name)
         # Give the now-consumerless exclusive/auto-delete queue a moment to
         # actually disappear broker-side before publishing again.
         await asyncio.sleep(0.3)
@@ -433,17 +434,17 @@ class AMQPCoverageTest(TestCase):
         self.assertEqual(received, [b'before-unregister'])  # nothing more arrived
 
     async def test_012_unregister_event_callback_never_registered_is_a_noop(self):
-        """Calling unregister_event_callback for a name that was never
+        """Calling _unregister_event_callback for a name that was never
         registered on this instance must not raise."""
         transport = await self._new_transport()
-        await transport.unregister_event_callback('never-registered')  # must not raise
+        await transport._unregister_event_callback('never-registered')  # must not raise
 
     async def test_012b_unregister_broadcast_callback_never_registered_is_a_noop(self):
-        """Same as above, for unregister_broadcast_callback - the negative
+        """Same as above, for _unregister_broadcast_callback - the negative
         branch of its `queue is not None and consumer_tag is not None and
         ...` guard, never exercised by test_011's happy-path lifecycle."""
         transport = await self._new_transport()
-        await transport.unregister_broadcast_callback('never-registered')  # must not raise
+        await transport._unregister_broadcast_callback('never-registered')  # must not raise
 
     # -- connect()/disconnect() idempotency --
 
@@ -459,9 +460,10 @@ class AMQPCoverageTest(TestCase):
         transport = AMQPTransport(namespace=self.namespace, url=AMQP_URL, prefix=self.namespace)
         await transport.disconnect()  # must not raise
 
-    async def test_015_unregister_callback_without_ever_registering_is_safe(self):
+    async def test_015_unregister_request_callback_without_ever_registering_is_safe(self):
         transport = await self._new_transport()
-        await transport.unregister_callback()  # must not raise even though register_callback was never called
+        # must not raise even though _register_request_callback was never called for this name
+        await transport._unregister_request_callback('never-registered')
 
     # -- the reconnect callback actually fires after a real reconnect --
 

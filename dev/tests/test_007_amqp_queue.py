@@ -84,7 +84,7 @@ class AMQPQueueTest(TestCase):
             done.set()
 
         router = get_router(namespace)
-        await router.activate_queue(task_name, transport)
+        await router.activate(transport)
 
         result = await record_event('hello')
         self.assertIsNone(result)  # fire-and-forget: no result is returned to the caller
@@ -111,8 +111,8 @@ class AMQPQueueTest(TestCase):
         async def _handle_b(content):
             received_b.append(content.decode())
 
-        await worker_a.register_event_callback(name, _handle_a)
-        await worker_b.register_event_callback(name, _handle_b)
+        await worker_a._register_event_callback(name, _handle_a)
+        await worker_b._register_event_callback(name, _handle_b)
 
         total = 40
         for i in range(total):
@@ -152,13 +152,13 @@ class AMQPQueueTest(TestCase):
             got_it.set()
 
         # The first registration will create a durable queue
-        await worker.register_event_callback(name, _handle)
-        await worker.unregister_event_callback(name)
+        await worker._register_event_callback(name, _handle)
+        await worker._unregister_event_callback(name)
         # First send the event before any consumer has registered
         await publisher.publish_event(name, b'queued-before-consumer')
         # check that the message published before the consumer was registered is NOT yet received
         await asyncio.sleep(1)  # give a moment to ensure the message is not yet received
         self.assertEqual(received, [], 'no message should be received before the consumer is registered')
-        await worker.register_event_callback(name, _handle)
+        await worker._register_event_callback(name, _handle)
         await asyncio.wait_for(got_it.wait(), timeout=5)
         self.assertEqual(received, ['queued-before-consumer'])

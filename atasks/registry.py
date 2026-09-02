@@ -69,6 +69,15 @@ class Manager(object):
             raise RegisteringTwice("Registering twice in %s: %s" % (self._name, name))
         self._registry[name] = item
 
+    def names(self):
+        """
+        Names of all currently registered items, in registration order
+
+        :returns: names of all currently registered items
+        :rtype: list
+        """
+        return list(self._registry.keys())
+
     def unregister(self, name):
         """
         Unregister the item

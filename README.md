@@ -41,9 +41,13 @@ from atasks.codecs import PickleCodec
     await transport.connect()
 
     if mode == 'server':
+        import my_package.tasks  # import every @atask/@atask_queue/@atask_broadcast module first
         router = get_router()
         await router.activate(transport)
 ```
+
+See [Client and Server](#client-and-server) below for why that import order
+matters.
 
 ## Namespaces
 
@@ -197,12 +201,22 @@ Other transport kinds may be implemented later.
 - `client_properties` - optional dict merged into the AMQP connection
   handshake (e.g. `{'connection_name': 'my-service'}`), useful for
   identifying connections in the broker's management UI/API.
-- `prefix` - routing-key/queue/exchange namespacing prefix (default
-  `'atask'`) - give distinct services/environments distinct prefixes to keep
-  their RPC queues, task-queues, and broadcast exchanges from colliding.
+- `prefix` - routing-key namespacing prefix (default `'atask'`) - give
+  distinct services/environments distinct prefixes to keep their RPC
+  requests, task-queue events, and broadcasts from colliding on the same
+  exchange.
+- `queue` - queue-naming prefix (default `'atask'`), combined with `prefix`
+  to name every durable queue this transport declares (one per registered
+  `@atask`, one per registered `@atask_queue`) - give distinct
+  services/environments distinct values to keep their queues from colliding
+  in the broker.
 
 See "Request timeout and combining `@atask` with `backoff`" below for how
 `AMQPTransport` surfaces RPC timeouts and connection loss to the caller.
+
+See [AMQP-TRANSPORT-TOPOLOGY.md](AMQP-TRANSPORT-TOPOLOGY.md) for the exact
+exchange/queue/routing-key layout `AMQPTransport` creates - useful when
+monitoring or administering the broker.
 
 #### Creating your own transport implementation
 
@@ -230,26 +244,31 @@ class MyTransport(Transport):
     async def publish_broadcast(self, name, content):
         ...
 
-    async def register_callback(self, callback):
+    async def _register_request_callback(self, name, callback):
         ...
 
-    async def register_event_callback(self, name, callback):
+    async def _register_event_callback(self, name, callback):
         ...
 
-    async def register_broadcast_callback(self, name, callback):
+    async def _register_broadcast_callback(self, name, callback):
         ...
 
-    async def unregister_callback(self):
+    async def _unregister_request_callback(self, name):
         ...
 
-    async def unregister_event_callback(self, name):
+    async def _unregister_event_callback(self, name):
         ...
 
-    async def unregister_broadcast_callback(self, name):
+    async def _unregister_broadcast_callback(self, name):
         ...
 
 
 ```
+
+The four `_register_*_callback`/`_unregister_*_callback` pairs are protected -
+`Router.activate()`/`deactivate()` are their only caller, once per name known
+to the router at the moment `activate()` runs (see [Client and
+Server](#client-and-server) below). Library users never call them directly.
 
 ### Client and Server
 
@@ -270,9 +289,26 @@ If your application is a server, listening to atask requests, events, and broadc
     transport = AMQPTransport()
     await transport.connect()
 
+    import my_package.tasks  # runs every @atask/@atask_queue/@atask_broadcast decorator
+
     router = get_router()
     await router.activate(transport)
 ```
+
+`router.activate(transport)` subscribes, once, to every `@atask`,
+`@atask_queue` and `@atask_broadcast` name already registered in this
+namespace at the moment it is called - each gets its own subscription (see
+[AMQP Transport](#amqp-transport) below for what that looks like on the
+wire), never a single catch-all one. Because of that, **every module
+containing `@atask`/`@atask_queue`/`@atask_broadcast` decorators this
+instance should serve must be imported before `router.activate(transport)` is
+called** - not after. Registering a new one afterwards raises
+`atasks.router.LateRegistration` instead of being silently ignored, so a
+wrong import order fails loudly rather than quietly dropping messages for
+whatever was registered too late.
+
+`router.deactivate()` unsubscribes everything the matching `activate()` call
+subscribed.
 
 ## Markup an asynchronous distributed task
 
@@ -382,22 +418,16 @@ event and returns `None` immediately - it does not wait for, or receive, any
 result.
 
 On the consuming side, a process registers itself as one of the (possibly
-several) competing consumers explicitly, since - unlike the RPC pattern's
-single `router.activate(transport)` - there can be more than one independent
-task-queue (and/or broadcast topic, see below) active in the same process:
+several) competing consumers simply by having imported the module with the
+`@atask_queue` decorator before calling `router.activate(transport)` - see
+[Client and Server](#client-and-server) above; there is no separate
+per-task-queue activation call to make.
 
-```python
-from atasks.router import get_router
-
-router = get_router()
-await router.activate_queue('mypackage.recalculate_rating', transport)
-```
-
-Every instance which calls `activate_queue` with the same name binds to the
-*same* durable, named queue - so they compete, and every published event is
-delivered to exactly one of them, never to more than one, and never lost even
-if published before any consumer has started (the queue is declared durably
-by the publisher too).
+Every instance whose `@atask_queue` shares the same name ends up bound to
+the *same* durable, named queue - so they compete, and every published event
+is delivered to exactly one of them, never to more than one, and never lost
+even if published before any consumer has started (the queue is declared
+durably by the publisher too).
 
 ## Broadcast/subscribe (fire-and-forget, fan-out)
 
@@ -416,12 +446,9 @@ async def relay_realtime_event(payload):
     ...
 ```
 
-```python
-from atasks.router import get_router
-
-router = get_router()
-await router.activate_broadcast('mypackage.relay_realtime_event', transport)
-```
+As with `@atask_queue` above, subscribing happens automatically for every
+`@atask_broadcast` name that was already registered when `router.activate(transport)`
+was called - see [Client and Server](#client-and-server).
 
 Topology: one shared (fanout) exchange per broadcast name, with one
 exclusive, auto-delete queue per subscribing instance bound to it - the same

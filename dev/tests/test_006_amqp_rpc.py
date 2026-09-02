@@ -277,6 +277,13 @@ class AMQPRPCTest(TestCase):
         # of real @atask calls genuinely time out over the wire before
         # backoff.on_exception on the *caller* side retries the whole call and it
         # eventually reaches the now-available worker and succeeds.
+        #
+        # Registering a new @atask requires the router to not be active (see
+        # Router.activate/LateRegistration) - deactivate the first part's
+        # activation of self.server_transport before registering
+        # becomes_available_late; nothing further needs flaky_worker_side served.
+        await router.deactivate()
+
         late_server_transport = AMQPTransport(namespace=namespace, url=AMQP_URL, prefix=namespace, queue=namespace)
         await late_server_transport.connect()
 

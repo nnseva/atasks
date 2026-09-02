@@ -49,13 +49,21 @@ class LoopbackTraceTest(TestCase):
     """Trace collection over the in-process LoopbackTransport"""
 
     async def _wire(self, namespace, **router_options):
-        """Construct a Router (with the given options) plus codec/transport for a fresh namespace."""
+        """
+        Construct a Router (with the given options) plus codec/transport for a
+        fresh namespace.
+
+        Deliberately does *not* call ``router.activate()`` - it only
+        subscribes to atasks already registered at the moment it runs, so the
+        caller must define every ``@atask``/``@atask_queue``/``@atask_broadcast``
+        for this namespace first, then call ``await router.activate(transport)``
+        itself (see ``Router.activate``/``LateRegistration``).
+        """
         Router(namespace=namespace, **router_options)
         PickleCodec(namespace=namespace)
         transport = LoopbackTransport(namespace=namespace)
         await transport.connect()
         router = get_router(namespace)
-        await router.activate(transport)
         return router, transport
 
     async def test_001_rpc_chain_carries_full_trace_to_the_root(self):
@@ -63,7 +71,7 @@ class LoopbackTraceTest(TestCase):
         original caller analyse both the upstream (root -> leaf) atask chain and
         the ordinary await frames on either side of it."""
         namespace = _fresh_namespace()
-        await self._wire(namespace, hostname='host-under-test')
+        router, transport = await self._wire(namespace, hostname='host-under-test')
 
         @atask(namespace=namespace)
         async def leaf(x):
@@ -77,6 +85,8 @@ class LoopbackTraceTest(TestCase):
         @atask(namespace=namespace)
         async def root(x):
             return await middle(x)
+
+        await router.activate(transport)
 
         # passed through a variable, not a literal, at the call site: a literal
         # would legitimately show up in the source-line text traceback always
@@ -125,11 +135,13 @@ class LoopbackTraceTest(TestCase):
         """An RPC failure is routed back to the caller silently - the router itself
         must not log it, since the caller decides whether/how to log it."""
         namespace = _fresh_namespace()
-        await self._wire(namespace)
+        router, transport = await self._wire(namespace)
 
         @atask(namespace=namespace)
         async def boom():
             raise ValueError('kaboom')
+
+        await router.activate(transport)
 
         with self.assertNoLogs('atasks.router', level='WARNING'):
             with self.assertRaises(ValueError):
@@ -147,7 +159,7 @@ class LoopbackTraceTest(TestCase):
         async def failing_queue_task(x):
             raise RuntimeError('queue boom: %s' % x)
 
-        await router.activate_queue(task_name, transport)
+        await router.activate(transport)
 
         with self.assertLogs('atasks.router', level='ERROR') as logs:
             await failing_queue_task(1)
@@ -166,7 +178,7 @@ class LoopbackTraceTest(TestCase):
         async def failing_broadcast_task(x):
             raise RuntimeError('broadcast boom: %s' % x)
 
-        await router.activate_broadcast(task_name, transport)
+        await router.activate(transport)
 
         with self.assertLogs('atasks.router', level='ERROR') as logs:
             await failing_broadcast_task(1)
@@ -176,13 +188,15 @@ class LoopbackTraceTest(TestCase):
         """A runaway recursive atask call chain is stopped locally, before ever
         reaching the transport, once it would exceed max_trace_depth."""
         namespace = _fresh_namespace()
-        await self._wire(namespace, max_trace_depth=5)
+        router, transport = await self._wire(namespace, max_trace_depth=5)
 
         @atask(namespace=namespace)
         async def recurse(depth):
             if depth >= 1000:
                 return depth  # pragma: no cover - safety net, the depth guard fires first
             return await recurse(depth + 1)
+
+        await router.activate(transport)
 
         with self.assertRaises(trace.AtaskStackTooDeep):
             await recurse(0)
@@ -191,7 +205,7 @@ class LoopbackTraceTest(TestCase):
         """With collect_await_frames disabled, no ordinary await frame is
         collected anywhere - only the atask hops themselves remain."""
         namespace = _fresh_namespace()
-        await self._wire(namespace, collect_await_frames=False)
+        router, transport = await self._wire(namespace, collect_await_frames=False)
 
         @atask(namespace=namespace)
         async def leaf(x):
@@ -200,6 +214,8 @@ class LoopbackTraceTest(TestCase):
         @atask(namespace=namespace)
         async def root(x):
             return await leaf(x)
+
+        await router.activate(transport)
 
         with self.assertRaises(ValueError) as ctx:
             await root(1)
@@ -212,7 +228,7 @@ class LoopbackTraceTest(TestCase):
         """trace_filter_modules strips the named modules' frames out of the
         ordinary-await parts of the trace, while keeping user-code frames."""
         namespace = _fresh_namespace()
-        await self._wire(namespace, trace_filter_modules=['atasks'])
+        router, transport = await self._wire(namespace, trace_filter_modules=['atasks'])
 
         @atask(namespace=namespace)
         async def leaf(x):
@@ -221,6 +237,8 @@ class LoopbackTraceTest(TestCase):
         @atask(namespace=namespace)
         async def root(x):
             return await leaf(x)
+
+        await router.activate(transport)
 
         with self.assertRaises(ValueError) as ctx:
             await root(1)
@@ -236,7 +254,7 @@ class LoopbackTraceTest(TestCase):
         hops - even with no trace_filter_modules configured at all. Only the
         ordinary awaits genuinely local to the current hop should appear."""
         namespace = _fresh_namespace()
-        await self._wire(namespace)
+        router, transport = await self._wire(namespace)
 
         @atask(namespace=namespace)
         async def leaf(x):
@@ -254,6 +272,8 @@ class LoopbackTraceTest(TestCase):
         @atask(namespace=namespace)
         async def root(x):
             return await middle(x)
+
+        await router.activate(transport)
 
         with self.assertRaises(ValueError) as ctx:
             await root(1)
@@ -286,7 +306,7 @@ class LoopbackTraceTest(TestCase):
         the root hop specifically, its leaked ambient stack (there being no
         enclosing atask to bound it) called out and placed the same way."""
         namespace = _fresh_namespace()
-        await self._wire(namespace)
+        router, transport = await self._wire(namespace)
 
         @atask(namespace=namespace)
         async def leaf(x):
@@ -295,6 +315,8 @@ class LoopbackTraceTest(TestCase):
         @atask(namespace=namespace)
         async def root(x):
             return await leaf(x)
+
+        await router.activate(transport)
 
         async def _caller_wrapper(x):
             """Ordinary (non-atask) helper making the actual root call site."""

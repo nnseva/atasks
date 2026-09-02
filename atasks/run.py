@@ -44,23 +44,33 @@ async def aiomain(**options):
         Router(hostname=options['hostname'])
     try:
         router = get_router()
+        # Scenario modules are imported here, *before* router.activate() -
+        # it's their module-level @atask/@atask_queue/@atask_broadcast
+        # decorators that populate this namespace's registries, and
+        # activate() only subscribes to names already registered at the
+        # moment it runs (registering one afterwards raises
+        # atasks.router.LateRegistration - see the Router docstrings and
+        # ATASK-NEW-ARCHITECTURE-PLAN.md). Only the coroutine objects
+        # returned by `module.aiomain(**options)` (if present) are deferred -
+        # creating a coroutine object doesn't run its body, so gathering them
+        # only after activate() below still matches the previous behaviour.
+        futures = []
+        for filename in options['scenario']:
+            if os.path.exists(filename) and os.path.isfile(filename):
+                name = os.path.basename(filename).rsplit('.', 1)[0]
+                spec = importlib.util.spec_from_file_location(name, filename)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            else:
+                module = importlib.import_module(filename)
+
+            if hasattr(module, 'aiomain'):
+                futures.append(module.aiomain(**options))
+
         if options['mode'] in ('server', 'loopback'):
             await router.activate(transport)
         try:
-            futures = []
-            for filename in options['scenario']:
-                if os.path.exists(filename) and os.path.isfile(filename):
-                    name = os.path.basename(filename).rsplit('.', 1)[0]
-                    spec = importlib.util.spec_from_file_location(name, filename)
-                    module = importlib.util.module_from_spec(spec)
-                    sys.modules[name] = module
-                    spec.loader.exec_module(module)
-                else:
-                    module = importlib.import_module(filename)
-
-                if hasattr(module, 'aiomain'):
-                    futures.append(module.aiomain(**options))
-
             if futures:
                 await asyncio.gather(*futures)
 

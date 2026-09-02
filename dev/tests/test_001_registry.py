@@ -33,6 +33,16 @@ class ModuleTest(TestCase):
         manager.unregister('the test2')
         self.assertEqual(manager.get('the test2'), None)
 
+    def test_004_manager_names(self):
+        """Unit test for Manager.names()"""
+        manager = registry.Manager('test', unite=False)
+        self.assertEqual(manager.names(), [])
+        manager.register('the test', a=1)
+        manager.register('the test2', a=2)
+        self.assertEqual(manager.names(), ['the test', 'the test2'])
+        manager.unregister('the test')
+        self.assertEqual(manager.names(), ['the test2'])
+
     def test_003_manager_unite(self):
         """Unit test for manager with unite functions"""
         manager = registry.Manager('test')
