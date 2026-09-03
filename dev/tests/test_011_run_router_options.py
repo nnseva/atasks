@@ -35,7 +35,7 @@ class ParseNamespaceSpecTest(TestCase):
     def test_name_only_gets_every_default(self):
         self.assertEqual(_parse_namespace_spec('name=orders'), {
             'name': 'orders',
-            'mode': 'client',
+            'mode': 'loopback',
             'transport': 'loopback',
             'url': None,
             'hostname': None,
@@ -70,9 +70,9 @@ class ParseNamespaceSpecTest(TestCase):
             with self.subTest(value=value):
                 self.assertIs(_parse_namespace_spec('name=n,collect-await-frames=%s' % value)['collect_await_frames'], False)
 
-    def test_missing_name_is_rejected(self):
-        with self.assertRaises(Exception):
-            _parse_namespace_spec('mode=server')
+    def test_missing_name_is_default(self):
+        spec = _parse_namespace_spec('mode=server')
+        self.assertEqual(spec['name'], 'default')
 
     def test_unknown_key_is_rejected(self):
         with self.assertRaises(Exception):
@@ -84,7 +84,7 @@ class ParseNamespaceSpecTest(TestCase):
 
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(Exception):
-            _parse_namespace_spec('name=n,mode=loopback')
+            _parse_namespace_spec('name=n,mode=wrong')
 
     def test_invalid_max_trace_depth_is_rejected(self):
         with self.assertRaises(Exception):

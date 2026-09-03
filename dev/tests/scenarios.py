@@ -1,5 +1,40 @@
 """
-Processed scenarios
+# Typical usage scenarios for atasks with a single namespace
+
+Run this script using the command below to execute the scenario tests.
+
+## Simplest loopback run. Uses the default namespace in loopback mode.
+
+Requests itself for run some tasks calling the defined tasks in loopback mode.
+
+```bash
+python -m atasks.run -L atasks dev -v 4 dev.tests.scenarios
+```
+
+## AMQP loopback run. Uses the default namespace with the AMQP transport in loopback mode.
+
+Requests itself for run some tasks calling the defined tasks in loopback mode.
+```bash
+python -m atasks.run -L atasks dev -v 4 -N transport=amqp dev.tests.scenarios
+```
+
+## AMQP client/server run. Uses the default namespace with the AMQP transport.
+
+The server instance doesn't request any tasks itself, it only serves incoming requests:
+
+```bash
+python -m atasks.run -L atasks dev -v 4 -N transport=amqp,mode=server dev.tests.scenarios
+```
+
+Run server instances as many as you want.
+
+The client instance requests server instance(s) (started as above) for run some
+tasks calling the defined tasks.
+
+```bash
+python -m atasks.run -L atasks dev -v 4 -N transport=amqp,mode=client dev.tests.scenarios
+```
+
 """
 
 import asyncio
@@ -96,17 +131,12 @@ async def request_parallel():
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
     default_ns = {ns['name']: ns for ns in options['namespaces']}.get('default')
+    if default_ns is None:
+        logger.error("No default namespace found, the scenario cannot proceed.")
+        return
 
-    # A 'client' namespace expects some other, already-running process to
-    # serve 'default' (e.g. over amqp) - it's safe (and the point) to call
-    # into it here. A 'server' namespace only self-calls when paired with the
-    # loopback transport: that transport only ever reaches a Router activated
-    # in this very process (see README.md#commands), so this is the one-process
-    # server-and-client combination formerly known as run.py's 'loopback' mode -
-    # for a dedicated amqp-backed server, self-calling here would be wrong.
-    is_remote_client = default_ns and default_ns['mode'] == 'client'
-    is_self_hosted_server = default_ns and default_ns['mode'] == 'server' and default_ns['transport'] == 'loopback'
-    if is_remote_client or is_self_hosted_server:
+    if default_ns['mode'] in ('client', 'loopback'):
+        logger.info("Default namespace is in client/loopback mode, initiating requests.")
         a = await task_one(42)
         assert a == 42
 
@@ -116,3 +146,5 @@ async def aiomain(**options):
         await request_sequence()
         returns = await request_parallel()
         assert returns == [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]
+    else:
+        logger.info("Default namespace is in server mode, waiting for incoming requests.")

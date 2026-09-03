@@ -111,6 +111,10 @@ class AMQPTransport(Transport):
 
     # Functional method overrides
 
+    def is_connected(self):
+        """Override to implement transport connection check."""
+        return hasattr(self, '_connection') and not self._connection.is_closed
+
     async def disconnect(self):
         """Override to implement transport disconnection."""
         await self._lock.acquire()

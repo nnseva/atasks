@@ -40,11 +40,12 @@ def _parse_namespace_spec(spec):
 
     Recognized keys:
 
-    - ``name`` (required) - namespace name
-    - ``mode`` - ``client`` or ``server``, default: ``client``. A ``server``
-      namespace has its Router activated against its Transport; a ``client``
-      namespace only connects its Transport to send requests/events/broadcasts.
-    - ``transport`` - ``loopback`` or ``amqp``, default: ``loopback``
+    - ``name``  - namespace name (default: ``default``)
+    - ``mode`` - ``client``, ``server``, or ``loopback``, default: ``loopback``.
+        A ``server`` namespace has its Router activated against its Transport and waits for incoming requests/events.
+        A ``client`` namespace only connects its Transport to send requests/events/broadcasts.
+        A ``loopback`` namespace acts as both a client and a server within the same process,
+        but doesn't wait for incoming requests/events from external clients.
     - ``url`` - URL passed to the transport, e.g. the AMQP broker URL when
       ``transport=amqp``
     - ``hostname`` - default: auto-detected via ``socket.gethostname()``
@@ -80,12 +81,11 @@ def _parse_namespace_spec(spec):
             raise argparse.ArgumentTypeError("key %r given twice in %r" % (key, spec))
         raw[key] = value.strip()
 
-    if 'name' not in raw:
-        raise argparse.ArgumentTypeError("missing required 'name=' key in %r" % (spec,))
+    name = raw.get('name', 'default')
 
-    mode = raw.get('mode', 'client')
-    if mode not in ('client', 'server'):
-        raise argparse.ArgumentTypeError("mode must be 'client' or 'server', got %r in %r" % (mode, spec))
+    mode = raw.get('mode', 'loopback')
+    if mode not in ('client', 'server', 'loopback'):
+        raise argparse.ArgumentTypeError("mode must be 'client', 'server', or 'loopback', got %r in %r" % (mode, spec))
 
     transport = raw.get('transport', 'loopback')
     if transport not in ('loopback', 'amqp'):
@@ -117,7 +117,7 @@ def _parse_namespace_spec(spec):
             )
 
     return {
-        'name': raw['name'],
+        'name': name,
         'mode': mode,
         'transport': transport,
         'url': raw.get('url'),
@@ -128,6 +128,21 @@ def _parse_namespace_spec(spec):
     }
 
 
+async def _disconnect_connected_transports(namespace_specs):
+    """
+    Disconnect every namespace's transport that is currently connected.
+
+    :param namespace_specs: parsed -N/--namespace specs (only ``name`` is used)
+    :type namespace_specs: list[dict]
+    """
+    from atasks.transport.base import get_transport
+
+    for ns in namespace_specs:
+        transport = get_transport(ns['name'])
+        if transport is not None and transport.is_connected():
+            await transport.disconnect()
+
+
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
     from atasks.codecs import PickleCodec
@@ -135,14 +150,6 @@ async def aiomain(**options):
     from atasks.transport.backends.amqp import AMQPTransport
     from atasks.transport.base import LoopbackTransport
 
-    # Every namespace gets its own codec, Transport and (optionally, see
-    # below) Router - namespaces are fully independent of one another (see
-    # README.md#namespaces). Doing all of this *before* any scenario module is
-    # imported matters twice over: a custom Router must exist before the
-    # first (direct or indirect) get_router() call for its namespace to take
-    # effect (see the Router constructor docstring), and every namespace needs
-    # a transport connected before its @atask/@atask_queue/@atask_broadcast
-    # decorators (imported next) can be exercised.
     transports = {}
     server_namespaces = []
     for ns in options['namespaces']:
@@ -156,14 +163,14 @@ async def aiomain(**options):
             'loopback': LoopbackTransport,
             'amqp': AMQPTransport,
         }[ns['transport']](**kw)
-        await transport.connect()
-        transports[name] = transport
+        try:
+            await transport.connect()
+            transports[name] = transport
+        except Exception as e:
+            logger.error('Failed to connect transport for namespace %s: %s', name, e, exc_info=True)
+            await _disconnect_connected_transports(options['namespaces'])
+            return False
 
-        # Constructed explicitly only when at least one Router option was
-        # actually given for this namespace - otherwise get_router() below is
-        # left to lazily create (or reuse) its Router with the constructor's
-        # own defaults, so a namespace already set up by earlier code (its
-        # task registry included) is left untouched.
         router_kwargs = {}
         if ns['hostname'] is not None:
             router_kwargs['hostname'] = ns['hostname']
@@ -176,21 +183,11 @@ async def aiomain(**options):
         if router_kwargs:
             Router(namespace=name, **router_kwargs)
 
-        if ns['mode'] == 'server':
+        if ns['mode'] in ('server', 'loopback'):
             server_namespaces.append(name)
 
     try:
         routers = {name: get_router(namespace=name) for name in transports}
-        # Scenario modules are imported here, *before* any router.activate()
-        # below - it's their module-level @atask/@atask_queue/@atask_broadcast
-        # decorators that populate a namespace's registries, and activate()
-        # only subscribes to names already registered at the moment it runs
-        # (registering one afterwards raises atasks.router.LateRegistration -
-        # see the Router docstrings and ATASK-NEW-ARCHITECTURE-PLAN.md). Only
-        # the coroutine objects returned by `module.aiomain(**options)` (if
-        # present) are deferred - creating a coroutine object doesn't run its
-        # body, so gathering them only after activate() below still matches
-        # the previous behaviour.
         futures = []
         for filename in options['scenario']:
             if os.path.exists(filename) and os.path.isfile(filename):
@@ -209,39 +206,27 @@ async def aiomain(**options):
             await routers[name].activate(transports[name])
         try:
             if futures:
+                logger.info("Running scenario modules")
                 await asyncio.gather(*futures)
 
-            if server_namespaces:
-                logger.info("Listening for requests")
+            if any(ns['mode'] == 'server' for ns in options['namespaces']):
                 for s in set([
                     signal.SIGINT,
                     signal.SIGQUIT,
                     signal.SIGTERM,
                 ]):
                     signal.signal(s, sig_handler)
+                logger.info("Listening for requests")
 
                 while not exit_run:
                     await asyncio.sleep(1)
 
                 logger.info("Execution stopped")
         finally:
-            # Mirrors transport.connect() above: whatever happens in the body
-            # (exception, signal-triggered exit, or plain fallthrough for the
-            # no-scenario/all-client case), every server namespace's callback
-            # registered via router.activate() above must be torn down before
-            # its transport is disconnected below.
             for name in server_namespaces:
                 await routers[name].deactivate()
     finally:
-        # Without this, e.g. AMQPTransport leaves its underlying connection
-        # (and the reader/writer/heartbeat/reconnect tasks aio_pika runs on
-        # top of it) open when this coroutine returns. Those tasks are then
-        # still pending when the process exits, and get torn down mid-flight
-        # by the interpreter instead of shutting down cleanly - surfacing as
-        # "Task was destroyed but it is pending!" / "Event loop is closed"
-        # noise on every run, even a scenario-less one.
-        for transport in transports.values():
-            await transport.disconnect()
+        await _disconnect_connected_transports(options['namespaces'])
 
 
 def sig_handler(sig_num, stack_frame):
@@ -279,20 +264,34 @@ def main(argv):
 Configure one namespace to run - may be given multiple times, once per
 namespace, each with its own Transport/Router setup and mode. SPEC is a
 comma-separated key=value list:
-    name                      (required) namespace name
-    mode=client|server        default: client - a 'server' namespace has its
-                            Router activated; if any namespace is 'server'
-                            the process then listens for requests until a
-                            signal arrives
+    name                      default: default
+                                Namespace name
+    mode=client|server        default: client
+                                A 'server' namespace has its Router activated.
+                                If any namespace is 'server', the process then
+                                listens for requests until a signal arrives
     transport=loopback|amqp   default: loopback
-    url                       for transport=amqp
-    hostname                  default: auto-detected
+                                The 'loopback' transport should be used for
+                                local testing only. The 'amqp' transport
+                                may be used for real deployments.
+    url                       default: <empty>
+                                Only for AMQP transport, <empty> means
+                                amqp://guest:guest@localhost/
+    hostname                  default: <auto-detected>
+                                Is used to determine the hostname for the
+                                namespace during atask tracing
     max-trace-depth           default: 1000
-    trace-filter-modules=MOD1:MOD2:...    default: none filtered
+                                Maximum depth for tracing atask stack
     collect-await-frames=true|false       default: true
+                                Whether to collect await frames during
+                                atask tracing
+    trace-filter-modules=MOD1:MOD2:...    default: <none filtered>
+                                Modules to be filtered from await
+                                frames during atask tracing
 
-Default when omitted entirely: a single name=default namespace.
-See README.md#commands for the full reference and examples. 
+Default when omitted entirely: a single name=default namespace
+with loopback transport. See README.md (Commands section)
+for the full reference and examples.
         """),
     )
 

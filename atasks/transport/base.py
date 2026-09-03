@@ -98,6 +98,15 @@ class Transport(object):
         """
         raise NotImplementedError()
 
+    def is_connected(self):
+        """
+        Whether this transport currently holds a live connection to its backend.
+
+        :returns: True if connected, False otherwise
+        :rtype: bool
+        """
+        raise NotImplementedError()
+
     async def send_request(self, name, content, timeout=None):
         """
         Send a request to a service and await its response (RPC pattern).
@@ -264,6 +273,7 @@ class LoopbackTransport(Transport):
     def __init__(self, namespace='default'):
         """Overriden from the base class to add request/event/broadcast bookkeeping."""
         super().__init__(namespace)
+        self._connected = False
         self._request_callbacks = {}
         self._event_callbacks = {}
         self._broadcast_callbacks = {}
@@ -273,12 +283,20 @@ class LoopbackTransport(Transport):
         Overriden from the base class
         """
         logger.info('Connecting Loopback transport %s', self)
+        self._connected = True
 
     async def disconnect(self):
         """
         Overriden from the base class
         """
         logger.info('Disconnecting Loopback transport %s', self)
+        self._connected = False
+
+    def is_connected(self):
+        """
+        Overriden from the base class
+        """
+        return self._connected
 
     async def send_request(self, name, content, timeout=None):
         """

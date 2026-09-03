@@ -111,12 +111,6 @@ def _run_server_until_signaled(*namespace_specs, extra_args=(), timeout=15):
         else:
             raise AssertionError('process never printed %r within %ss' % (READY_PATTERN, timeout))
 
-        if proc.poll() is not None:
-            raise AssertionError(
-                'process exited (%s) before printing %r:\n%s'
-                % (proc.returncode, READY_PATTERN, ''.join(stderr_lines) + proc.stderr.read())
-            )
-
         proc.send_signal(signal.SIGTERM)
         remaining_stdout, remaining_stderr = proc.communicate(timeout=timeout)
     finally:

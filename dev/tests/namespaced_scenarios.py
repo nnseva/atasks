@@ -5,7 +5,6 @@ Processed scenarios
 import asyncio
 import logging
 
-from atasks import trace
 from atasks.tasks import atask
 
 

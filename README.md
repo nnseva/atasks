@@ -163,14 +163,9 @@ Transport determines the method of sending requests and returning results
 from awaiter to the performing coroutine and back to support awaiting
 `atask`s among a network.
 
-The `atasks.transport.base.LoopbackTransport` provided by the package passes
-all requests back to the awaiter thread only. It doesn't allow `atask`s
-performing distribution among several processes or even threads. You can
-use it for the testing purposes.
-
-The `atasks.transport.backends.amqp.AMQPTransport` provided by the package passes
-requests through the RabbitMQ or other AMQP broker to any ATasks worker started
-on the same or another host.
+The package provides two transport implementations:
+- `atasks.transport.base.LoopbackTransport`
+- `atasks.transport.backends.amqp.AMQPTransport`
 
 After creation a transport instance, the asynchronous `connect()` method of just
 created instance should be awaited.
@@ -190,26 +185,18 @@ created instance should be awaited.
 
 Other transport kinds may be implemented later.
 
+#### Loopback Transport
+
+The `atasks.transport.base.LoopbackTransport` provided by the package passes
+all requests back to the awaiter thread only. It doesn't allow `atask`s
+performing distribution among several processes or even threads. You can
+use it for the testing purposes.
+
 #### AMQP Transport
 
-`AMQPTransport` is built entirely on `aio_pika`. Notable constructor options:
-
-- `url` - the AMQP broker URL (default `amqp://localhost/`).
-- `reconnect_interval` - seconds between reconnection attempts after the
-  broker connection is lost (default `5`), passed straight through to
-  `aio_pika.connect_robust`.
-- `client_properties` - optional dict merged into the AMQP connection
-  handshake (e.g. `{'connection_name': 'my-service'}`), useful for
-  identifying connections in the broker's management UI/API.
-- `prefix` - routing-key namespacing prefix (default `'atask'`) - give
-  distinct services/environments distinct prefixes to keep their RPC
-  requests, task-queue events, and broadcasts from colliding on the same
-  exchange.
-- `queue` - queue-naming prefix (default `'atask'`), combined with `prefix`
-  to name every durable queue this transport declares (one per registered
-  `@atask`, one per registered `@atask_queue`) - give distinct
-  services/environments distinct values to keep their queues from colliding
-  in the broker.
+The `atasks.transport.backends.amqp.AMQPTransport` provided by the package passes
+requests through the RabbitMQ or other AMQP broker to any ATasks worker started
+on the same or another host.
 
 See "Request timeout and combining `@atask` with `backoff`" below for how
 `AMQPTransport` surfaces RPC timeouts and connection loss to the caller.
@@ -221,8 +208,7 @@ monitoring or administering the broker.
 #### Creating your own transport implementation
 
 User can inherit `atasks.transport.base.Transport` as a base class and create an own
-transport implementation. Just replace all methods generating `NotImplementedError`. Note that
-most of methods are asynchronous.
+transport implementation. Just replace all methods generating `NotImplementedError`. Note that most of methods are asynchronous.
 
 ```python
 from atasks.transport.base import Transport
@@ -233,6 +219,9 @@ class MyTransport(Transport):
         ...
 
     async def disconnect(self):
+        ...
+
+    def is_connected(self):
         ...
 
     async def send_request(self, name, content):
@@ -261,7 +250,6 @@ class MyTransport(Transport):
 
     async def _unregister_broadcast_callback(self, name):
         ...
-
 
 ```
 
@@ -340,7 +328,6 @@ Both bare (`@atask`) and parameterized (`@atask(...)`) forms work, and so do the
 
 The `atask` is awaited as a usual coroutine. You can use `await` keyword, or get a `future` calling `atask` synchronously and control future using `asyncio` module.
 
-
 ```python
 @atask
 async def some_task(a):
@@ -355,14 +342,14 @@ async def not_a_task_just_coro():
     ...
 ```
 
-## Request timeout and combining `@atask` with `backoff`
+## Request timeout and combining `@atask` with `@backoff`
 
 `@atask` accepts an optional `timeout` (seconds). If the worker doesn't reply
 in time, the caller gets `atasks.transport.base.RequestTimeoutError` instead
 of waiting forever - see "When the worker evaluating `atask` is crashed"
 above for the full story, including connection-loss handling.
 
-Because `@atask` and `backoff.on_exception(...)` are both just async-function
+Because `@atask` and `@backoff.on_exception(...)` are both just async-function
 decorators, they compose in either order for either purpose. The recommended
 shape for a function that runs remotely applies independent retry policies on
 each side of the wire:
@@ -380,11 +367,11 @@ async def some_processing_function(...):
     return result
 ```
 
-- The **worker-side** `backoff.on_exception` retries the underlying function
+- The **worker-side** `@backoff.on_exception` retries the underlying function
   locally before ever reporting failure back to the caller - transient
   problems (a flaky downstream HTTP call, a momentary DB hiccup) never even
   cross the wire.
-- The **caller-side** `backoff.on_exception` retries the entire remote call -
+- The **caller-side** `@backoff.on_exception` retries the entire remote call -
   including a fresh `correlation_id` and reply-to round trip - when the
   worker-side retries were exhausted, when the worker crashed outright
   (`ConnectionLostError` while a request was in flight, or the same
@@ -393,8 +380,8 @@ async def some_processing_function(...):
 
 Decorator order matters: `@atask` must sit directly on the function that
 should be registered as (and invoked as) the remote task; a worker-side
-`backoff.on_exception` goes *below* it (applied to the plain local coroutine
-first), while a caller-side `backoff.on_exception` goes *above* it (applied
+`@backoff.on_exception` goes *below* it (applied to the plain local coroutine
+first), while a caller-side `@backoff.on_exception` goes *above* it (applied
 to the network-calling stub `@atask` produces).
 
 ## Task-queue (fire-and-forget, competing consumers)
@@ -541,8 +528,8 @@ a comma-separated `key=value` list:
 
 | Key                     | Default    | Meaning |
 |--------------------------|------------|---------|
-| `name`                   | *(required)* | Namespace name |
-| `mode`                   | `client`   | `client` - only connects the transport to send requests/events/broadcasts. `server` - additionally activates this namespace's `Router` against its transport, so it serves requests too |
+| `name`                   | `default` | Namespace name |
+| `mode`                   | `loopback`   | `client` - only connects the transport to send requests/events/broadcasts from the `aiomain` function of the scenario. `server` - additionally activates this namespace's `Router` against its transport, executes `aiomain` and waits to serve requests, `loopback` - connects and activates, but doesn't wait for incoming requests and stops immediately after `aiomain` executed. |
 | `transport`              | `loopback` | `loopback` or `amqp` |
 | `url`                    | *(none)*   | Passed to the transport, e.g. the broker URL for `transport=amqp` |
 | `hostname`               | auto-detected | See the `Router` constructor's `hostname` |
@@ -550,28 +537,44 @@ a comma-separated `key=value` list:
 | `trace-filter-modules`   | none filtered | `:`-separated dotted module name prefixes - see the `Router` constructor's `trace_filter_modules` |
 | `collect-await-frames`   | `true`     | `true`/`false` - see the `Router` constructor's `collect_await_frames` |
 
-**If any configured namespace is `server`, the process activates every
-`server` namespace's `Router` and then blocks, "Listening for requests", until
-a signal (`SIGINT`/`SIGQUIT`/`SIGTERM`) arrives** - regardless of how many
-other namespaces are `client`. With every namespace `client` (including the
-default, single-namespace case below), the process runs any scenario
-`aiomain()`s to completion and returns on its own.
+**If any configured namespace is in mode `server`, the process activates every
+`server` and `loopback` namespace's `Router` and then blocks,
+"Listening for requests"** - regardless of how many
+other namespaces are `client` or `loopback`.
+
+The process runs any scenarios' `aiomain()`s to completion. 
 
 Omitting `-N`/`--namespace` entirely is equivalent to a single
-`-N name=default` - a `client` namespace named `default` over the loopback
-transport:
+`-N name=default` - a namespace named `default` over the loopback
+transport in the loopback (default) mode:
 
 ```bash
 python -m atasks.run dev.tests.scenarios --verbosity 3
 ```
 
-A `server` namespace paired with the loopback transport lets one process act
-as both server and client for that namespace - this is what
-`dev/tests/scenarios.py`'s own `aiomain()` uses to self-test:
+A `server` mode paired with the `amqp` transport lets one process act
+as both server and client for that namespace, and wait for incoming requests:
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N name=default,mode=server --verbosity 3
+python -m atasks.run dev.tests.scenarios -N mode=server,transport=amqp --verbosity 3
 ```
+
+A `client` mode paired with the `amqp` transport lets one process act
+as a pure client, executing it's `aiomain()` function to request server(s):
+
+```bash
+python -m atasks.run dev.tests.scenarios -N mode=client,transport=amqp --verbosity 3
+```
+
+A `loopback` mode is similar to the `loopback` mode, but doesn't wait for incoming
+requests, just executes `aiomain()` and exits:
+
+
+```bash
+python -m atasks.run dev.tests.scenarios -N mode=loopback,transport=amqp --verbosity 3
+```
+
+You can use the `loopback` mode to create necessary durable AMQP queues before the service is deployed for the very first time on this AMQP server (see also [AMQP Transport Topology](AMQP-TRANSPORT-TOPOLOGY.md))
 
 Several independent namespaces, each with its own transport/mode, in one
 process:
