@@ -2,8 +2,10 @@
 ``atasks.service`` command-line runner tests
 """
 import asyncio
+import os
 from contextlib import redirect_stdout
 from io import StringIO
+from tempfile import TemporaryDirectory
 from unittest import IsolatedAsyncioTestCase as TestCase
 from unittest.mock import patch
 
@@ -70,6 +72,61 @@ class ModuleTest(TestCase):
             ['atasks service', 'example.tasks', '--verbosity=3']
         )
 
+    def test_cli_refs_generates_references_from_relative_module_path(self):
+        """The refs command derives task names relative to its working directory."""
+        source = '''\
+from atasks.tasks import atask, atask_broadcast, atask_queue
+
+@atask
+async def add():
+    pass
+
+@atask_queue(namespace='workers')
+async def send_email():
+    pass
+
+@atask_broadcast(name='cache.clear')
+async def invalidate_cache():
+    pass
+'''
+        with TemporaryDirectory() as directory:
+            package = os.path.join(directory, 'app')
+            os.mkdir(package)
+            source_path = os.path.join(package, 'tasks.py')
+            with open(source_path, 'w', encoding='utf-8') as source_file:
+                source_file.write(source)
+            previous_directory = os.getcwd()
+            try:
+                os.chdir(directory)
+                cli_module.main(['atasks', 'refs', 'app/tasks.py'])
+            finally:
+                os.chdir(previous_directory)
+
+            with open(os.path.join(package, 'tasks_refs.py'), encoding='utf-8') as references_file:
+                references = references_file.read()
+
+        self.assertEqual(references, '''\
+from atasks.refs import atask_bref, atask_qref, ataskref
+
+add = ataskref['app.tasks.add']
+send_email = atask_qref(namespace='workers')['app.tasks.send_email']
+invalidate_cache = atask_bref['cache.clear']
+''')
+
+    def test_cli_refs_module_option_overrides_derived_module_name(self):
+        """The optional module argument controls default atask names."""
+        with TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, 'tasks.py')
+            with open(source_path, 'w', encoding='utf-8') as source_file:
+                source_file.write('@atask\nasync def work():\n    pass\n')
+
+            cli_module.main(['atasks', 'refs', source_path, '--module', 'remote.tasks'])
+
+            with open(os.path.join(directory, 'tasks_refs.py'), encoding='utf-8') as references_file:
+                references = references_file.read()
+
+        self.assertIn("work = ataskref['remote.tasks.work']", references)
+
     def test_cli_help_matches_root_help(self):
         """The ``help`` subcommand remains an alias for the root help output."""
         root_help = StringIO()
@@ -83,6 +140,28 @@ class ModuleTest(TestCase):
 
         self.assertEqual(root_exit.exception.code, 0)
         self.assertEqual(command_help.getvalue(), root_help.getvalue())
+
+    def test_cli_help_describes_subcommands(self):
+        """Root help explains the purpose of each supported subcommand."""
+        output = StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                cli_module.main(['atasks', '--help'])
+
+        help_text = ' '.join(output.getvalue().split())
+        self.assertIn('serve their declared tasks', help_text)
+        self.assertIn('lightweight references to declared tasks', help_text)
+
+    def test_cli_subcommand_help_includes_subcommand_in_usage(self):
+        """Delegated command help retains the command name without its executable path."""
+        for command in ('service', 'refs'):
+            output = StringIO()
+            with redirect_stdout(output):
+                with self.assertRaises(SystemExit) as error:
+                    cli_module.main(['/usr/local/bin/atasks', command, '--help'])
+
+            self.assertEqual(error.exception.code, 0)
+            self.assertTrue(output.getvalue().startswith('usage: atasks %s ' % command))
 
     async def test_run_scenario_end_to_end(self):
         """Regression/integration test: a 'server' namespace paired with the

@@ -555,7 +555,15 @@ the use case needs it at all - the delivery mechanism itself won't help.
 
 ## Commands
 
-The package provides a command-line interface through the `atasks.service` module.
+The package provides a command-line interface through the `atasks` command:
+
+```bash
+atasks <command> [options]
+```
+
+Use `atasks help` to display the top-level command reference.
+
+### `service`
 
 Run one or more files or Python modules containing `@atask` definitions and an
 optional asynchronous `aiomain` coroutine:
@@ -565,7 +573,6 @@ atasks service file-or-module [file-or-module ...] [options]
 ```
 
 The equivalent module invocation is `python -m atasks.service`.
-Use `atasks help` to display the top-level command reference.
 
 Each referenced file or module is loaded once, regardless of how many
 namespaces it registers `@atask`s into (see [Namespaces](#namespaces)). If it
@@ -573,7 +580,7 @@ defines `aiomain`, that coroutine is evaluated; parsed command-line options
 (including the parsed `-N`/`--namespace` list, see below) are passed to it as
 keyword arguments - see `dev/tests/scenarios.py` for an example.
 
-### Namespaces on the command line
+#### Namespaces on the command line
 
 Every namespace the run is meant to touch - even a single one - is configured
 with its own `-N`/`--namespace SPEC`, repeatable, one per namespace. `SPEC` is
@@ -664,6 +671,63 @@ enlisting them all in the command line.
 
 You can start several server process instances, the client will then request them
 in arbitrary order.
+
+### `refs`
+
+Generate a sibling Python module containing lightweight references for every
+top-level function declared with `@atask`, `@atask_queue`, or
+`@atask_broadcast`:
+
+```bash
+atasks refs path/to/tasks.py [--module package.tasks]
+```
+
+The command reads and parses the source file without importing it, then writes
+`path/to/tasks_refs.py`. The generated module imports `ataskref`, `atask_qref`,
+and `atask_bref` from `atasks.refs`, assigning each reference to the same Python
+function name as its declaration:
+
+```python
+# tasks.py
+from atasks.tasks import atask, atask_queue
+
+@atask
+async def add(left, right):
+    ...
+
+@atask_queue(namespace='workers')
+async def send_email(message):
+    ...
+```
+
+```python
+# tasks_refs.py
+from atasks.refs import atask_bref, atask_qref, ataskref
+
+add = ataskref['package.tasks.add']
+send_email = atask_qref(namespace='workers')['package.tasks.send_email']
+```
+
+For decorators without an explicit `name=`, the task name normally uses the
+source path relative to the current directory. Thus, when run from the project
+root, `atasks refs package/tasks.py` creates references named
+`package.tasks.<function>`, matching an `atasks service package.tasks` run from
+the same directory. Pass `--module package.tasks` to set that module portion
+explicitly, which is useful when the source path and import path differ.
+
+An explicit string `name=` or `namespace=` on the source decorator is preserved
+in the generated reference. `name=` and `namespace=` must be string literals so
+the command can determine them without executing the source module.
+
+### `help`
+
+Display the top-level command reference:
+
+```bash
+atasks help
+```
+
+This is equivalent to `atasks --help`.
 
 ## Inspiration
 

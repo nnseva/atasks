@@ -242,7 +242,11 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv
 
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog=argv[0],
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Run task service scenario modules and serve their declared tasks"
+    )
     parser.add_argument(
         'scenario',
         nargs='*',

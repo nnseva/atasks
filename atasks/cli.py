@@ -1,5 +1,6 @@
 """Top-level command-line interface for ATasks."""
 import argparse
+import os
 import sys
 
 
@@ -8,11 +9,18 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Asynchronous task management framework command-line interface',
+    )
     subparsers = parser.add_subparsers(dest='command', required=True)
     subparsers.add_parser(
         'service',
-        help='Run task service scenario modules',
+        help='Run task service scenario modules and serve their declared tasks',
+    )
+    subparsers.add_parser(
+        'refs',
+        help='Generate a _refs.py module with lightweight references to declared tasks',
     )
     subparsers.add_parser(
         'help',
@@ -22,6 +30,9 @@ def main(argv=None):
 
     if options.command == 'service':
         from atasks.service import main as service_main
-        service_main([argv[0] + ' service'] + argv[2:])
+        service_main([os.path.basename(argv[0]) + ' service'] + argv[2:])
+    elif options.command == 'refs':
+        from atasks.refs_command import main as refs_main
+        refs_main([os.path.basename(argv[0]) + ' refs'] + argv[2:])
     elif options.command == 'help':
         parser.print_help()
