@@ -8,14 +8,14 @@ Run this script using the command below to execute the scenario tests.
 Requests itself for run some tasks calling the defined tasks in loopback mode.
 
 ```bash
-python -m atasks.service -L atasks dev -v 4 dev.tests.scenarios
+python -m atasks.commands.service -L atasks dev -v 4 dev.tests.scenarios
 ```
 
 ## AMQP loopback run. Uses the default namespace with the AMQP transport in loopback mode.
 
 Requests itself for run some tasks calling the defined tasks in loopback mode.
 ```bash
-python -m atasks.service -L atasks dev -v 4 -N transport=amqp dev.tests.scenarios
+python -m atasks.commands.service -L atasks dev -v 4 -N transport=amqp dev.tests.scenarios
 ```
 
 ## AMQP client/server run. Uses the default namespace with the AMQP transport.
@@ -23,7 +23,7 @@ python -m atasks.service -L atasks dev -v 4 -N transport=amqp dev.tests.scenario
 The server instance doesn't request any tasks itself, it only serves incoming requests:
 
 ```bash
-python -m atasks.service -L atasks dev -v 4 -N transport=amqp,mode=server dev.tests.scenarios
+python -m atasks.commands.service -L atasks dev -v 4 -N transport=amqp,mode=server dev.tests.scenarios
 ```
 
 Run server instances as many as you want.
@@ -32,7 +32,7 @@ The client instance requests server instance(s) (started as above) for run some
 tasks calling the defined tasks.
 
 ```bash
-python -m atasks.service -L atasks dev -v 4 -N transport=amqp,mode=client dev.tests.scenarios
+python -m atasks.commands.service -L atasks dev -v 4 -N transport=amqp,mode=client dev.tests.scenarios
 ```
 
 """

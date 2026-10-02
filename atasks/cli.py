@@ -29,10 +29,10 @@ def main(argv=None):
     options = parser.parse_args(argv[1:2])
 
     if options.command == 'service':
-        from atasks.service import main as service_main
+        from atasks.commands.service import main as service_main
         service_main([os.path.basename(argv[0]) + ' service'] + argv[2:])
     elif options.command == 'refs':
-        from atasks.refs_command import main as refs_main
+        from atasks.commands.refs import main as refs_main
         refs_main([os.path.basename(argv[0]) + ' refs'] + argv[2:])
     elif options.command == 'help':
         parser.print_help()

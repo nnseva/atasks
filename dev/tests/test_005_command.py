@@ -1,5 +1,5 @@
 """
-``atasks.service`` command-line runner tests
+``atasks.commands.service`` command-line runner tests
 """
 import asyncio
 import os
@@ -10,8 +10,8 @@ from unittest import IsolatedAsyncioTestCase as TestCase
 from unittest.mock import patch
 
 import atasks.cli as cli_module
-import atasks.service as run_module
-from atasks.service import aiomain, main
+import atasks.commands.service as run_module
+from atasks.commands.service import aiomain, main
 from atasks.transport.base import LoopbackTransport
 
 
@@ -43,7 +43,7 @@ async def _stop_soon(delay=0.05):
     an external SIGINT/SIGQUIT/SIGTERM (see ``sig_handler()``) so a 'server'
     namespace's "Listening for requests" wait loop in ``aiomain()`` returns
     instead of blocking the test forever. Real signal delivery against a
-    background ``python -m atasks.service`` process is covered separately by
+    background ``python -m atasks.commands.service`` process is covered separately by
     test_009_run_shutdown.py.
     """
     await asyncio.sleep(delay)
@@ -65,7 +65,7 @@ class ModuleTest(TestCase):
 
     def test_cli_service_forwards_arguments_to_runner(self):
         """The top-level ``service`` command delegates to the established runner."""
-        with patch('atasks.service.main') as service_main:
+        with patch('atasks.commands.service.main') as service_main:
             cli_module.main(['atasks', 'service', 'example.tasks', '--verbosity=3'])
 
         service_main.assert_called_once_with(
@@ -188,7 +188,7 @@ invalidate_cache = atask_bref['cache.clear']
         connects, even with zero scenarios to run - otherwise a real transport
         (e.g. AMQPTransport) leaves background tasks dangling for the interpreter
         to tear down out of order on exit, instead of a clean shutdown. See the
-        reported ``python -m atasks.service -N mode=client,transport=amqp`` shutdown
+        reported ``python -m atasks.commands.service -N mode=client,transport=amqp`` shutdown
         noise ("Task was destroyed but it is pending!" / "Event loop is closed").
 
         Stands in for a real AMQP-backed run (which needs a broker, see

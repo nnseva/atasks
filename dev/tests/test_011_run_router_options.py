@@ -1,5 +1,5 @@
 """
-Tests for ``atasks.service``'s -N/--namespace SPEC parsing (``_parse_namespace_spec``)
+Tests for ``atasks.commands.service``'s -N/--namespace SPEC parsing (``_parse_namespace_spec``)
 and for how ``main()``/``aiomain()`` translate a parsed SPEC into the matching
 :class:`atasks.router.Router` constructor arguments for its namespace -
 ``hostname``, ``max-trace-depth``, ``trace-filter-modules`` and
@@ -18,8 +18,8 @@ signal/subprocess machinery needed.
 import uuid
 from unittest import TestCase
 
+from atasks.commands.service import _parse_namespace_spec, main
 from atasks.router import get_router
-from atasks.service import _parse_namespace_spec, main
 
 
 def _fresh_namespace():
