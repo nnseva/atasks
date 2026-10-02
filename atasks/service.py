@@ -12,12 +12,12 @@ import sys
 
 
 # Not logging.getLogger(__name__): this module is meant to be run as
-# `python -m atasks.run`, which makes __name__ '__main__' rather than
-# 'atasks.run' - decoupled from the 'atasks' logger hierarchy that -L/
+# `python -m atasks.service`, which makes __name__ '__main__' rather than
+# 'atasks.service' - decoupled from the 'atasks' logger hierarchy that -L/
 # --loggers (and its 'atasks' default) configures below, so every log call in
 # this file would otherwise be silently dropped by logging's lastResort
 # handler (WARNING+ only, straight to stderr) whenever actually run that way.
-logger = logging.getLogger('atasks.run')
+logger = logging.getLogger('atasks.service')
 
 exit_run = False
 
@@ -237,8 +237,11 @@ def sig_handler(sig_num, stack_frame):
     exit_run = True
 
 
-def main(argv):
+def main(argv=None):
     """Module main"""
+    if argv is None:
+        argv = sys.argv
+
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
         'scenario',

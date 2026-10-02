@@ -555,14 +555,17 @@ the use case needs it at all - the delivery mechanism itself won't help.
 
 ## Commands
 
-The package provides a command-line interface through the `atasks.run` module.
+The package provides a command-line interface through the `atasks.service` module.
 
 Run one or more files or Python modules containing `@atask` definitions and an
 optional asynchronous `aiomain` coroutine:
 
 ```bash
-python -m atasks.run file-or-module [file-or-module ...] [options]
+atasks service file-or-module [file-or-module ...] [options]
 ```
+
+The equivalent module invocation is `python -m atasks.service`.
+Use `atasks help` to display the top-level command reference.
 
 Each referenced file or module is loaded once, regardless of how many
 namespaces it registers `@atask`s into (see [Namespaces](#namespaces)). If it
@@ -599,21 +602,21 @@ Omitting `-N`/`--namespace` entirely is equivalent to a single
 transport in the loopback (default) mode:
 
 ```bash
-python -m atasks.run dev.tests.scenarios --verbosity 3
+atasks service dev.tests.scenarios --verbosity 3
 ```
 
 A `server` mode paired with the `amqp` transport lets one process act
 as both server and client for that namespace, and wait for incoming requests:
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=server,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=server,transport=amqp --verbosity 3
 ```
 
 A `client` mode paired with the `amqp` transport lets one process act
 as a pure client, executing it's `aiomain()` function to request server(s):
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=client,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=client,transport=amqp --verbosity 3
 ```
 
 A `loopback` mode is similar to the `loopback` mode, but doesn't wait for incoming
@@ -621,7 +624,7 @@ requests, just executes `aiomain()` and exits:
 
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=loopback,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=loopback,transport=amqp --verbosity 3
 ```
 
 You can use the `loopback` mode to create necessary durable AMQP queues before the service is deployed for the very first time on this AMQP server (see also [AMQP Transport Topology](AMQP-TRANSPORT-TOPOLOGY.md))
@@ -630,7 +633,7 @@ Several independent namespaces, each with its own transport/mode, in one
 process:
 
 ```bash
-python -m atasks.run my_scenarios.py \
+atasks service my_scenarios.py \
     -N name=orders,mode=server,transport=amqp,url=amqp://broker/,hostname=worker-1 \
     -N name=billing,mode=client,transport=amqp,url=amqp://broker/
 ```
@@ -644,7 +647,7 @@ Other options, independent of any namespace:
 Run the module with `--help` to see the complete command-line reference:
 
 ```bash
-python -m atasks.run --help
+atasks service --help
 ```
 
 Note that if you use a dedicated `server` process instance reached from
@@ -770,7 +773,7 @@ Router(
 )
 ```
 
-`run.py` exposes these as the `hostname`, `max-trace-depth`, `trace-filter-modules`
+`service.py` exposes these as the `hostname`, `max-trace-depth`, `trace-filter-modules`
 and `collect-await-frames` keys of its per-namespace `-N`/`--namespace SPEC` -
 see [Commands](#commands).
 
@@ -825,5 +828,5 @@ There isn't a dedicated synchronous API, and none is planned - `atask` is an
 `async def` coroutine like any other, so use it the same way you would use
 any other coroutine from synchronous code: `asyncio.run(some_task(...))` (or
 `loop.run_until_complete(...)` if you already manage your own loop). See
-`atasks/run.py` for exactly this pattern (`aiomain` is invoked via
+`atasks/service.py` for exactly this pattern (`aiomain` is invoked via
 `loop.run_until_complete`).

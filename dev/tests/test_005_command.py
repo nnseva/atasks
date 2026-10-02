@@ -1,12 +1,15 @@
 """
-``atasks.run`` command-line runner tests
+``atasks.service`` command-line runner tests
 """
 import asyncio
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest import IsolatedAsyncioTestCase as TestCase
 from unittest.mock import patch
 
-import atasks.run as run_module
-from atasks.run import aiomain, main
+import atasks.cli as cli_module
+import atasks.service as run_module
+from atasks.service import aiomain, main
 from atasks.transport.base import LoopbackTransport
 
 
@@ -38,7 +41,7 @@ async def _stop_soon(delay=0.05):
     an external SIGINT/SIGQUIT/SIGTERM (see ``sig_handler()``) so a 'server'
     namespace's "Listening for requests" wait loop in ``aiomain()`` returns
     instead of blocking the test forever. Real signal delivery against a
-    background ``python -m atasks.run`` process is covered separately by
+    background ``python -m atasks.service`` process is covered separately by
     test_009_run_shutdown.py.
     """
     await asyncio.sleep(delay)
@@ -56,7 +59,30 @@ class ModuleTest(TestCase):
         """A 'client'-only run (the default when no -N is given at all) must
         complete and return - it never activates a Router, so it can never
         end up waiting for a signal."""
-        main(['run.py', '--verbosity=3'])
+        main(['service.py', '--verbosity=3'])
+
+    def test_cli_service_forwards_arguments_to_runner(self):
+        """The top-level ``service`` command delegates to the established runner."""
+        with patch('atasks.service.main') as service_main:
+            cli_module.main(['atasks', 'service', 'example.tasks', '--verbosity=3'])
+
+        service_main.assert_called_once_with(
+            ['atasks service', 'example.tasks', '--verbosity=3']
+        )
+
+    def test_cli_help_matches_root_help(self):
+        """The ``help`` subcommand remains an alias for the root help output."""
+        root_help = StringIO()
+        with redirect_stdout(root_help):
+            with self.assertRaises(SystemExit) as root_exit:
+                cli_module.main(['atasks', '--help'])
+
+        command_help = StringIO()
+        with redirect_stdout(command_help):
+            cli_module.main(['atasks', 'help'])
+
+        self.assertEqual(root_exit.exception.code, 0)
+        self.assertEqual(command_help.getvalue(), root_help.getvalue())
 
     async def test_run_scenario_end_to_end(self):
         """Regression/integration test: a 'server' namespace paired with the
@@ -83,7 +109,7 @@ class ModuleTest(TestCase):
         connects, even with zero scenarios to run - otherwise a real transport
         (e.g. AMQPTransport) leaves background tasks dangling for the interpreter
         to tear down out of order on exit, instead of a clean shutdown. See the
-        reported ``python -m atasks.run -N mode=client,transport=amqp`` shutdown
+        reported ``python -m atasks.service -N mode=client,transport=amqp`` shutdown
         noise ("Task was destroyed but it is pending!" / "Event loop is closed").
 
         Stands in for a real AMQP-backed run (which needs a broker, see
@@ -97,7 +123,7 @@ class ModuleTest(TestCase):
 
         class RecordingTransport(LoopbackTransport):
             def __init__(self, url=None, **kwargs):
-                # Accept (and ignore) the 'url' kwarg run.py passes for transport=amqp.
+                # Accept (and ignore) the 'url' kwarg service.py passes for transport=amqp.
                 super().__init__(**kwargs)
 
             async def connect(self):
