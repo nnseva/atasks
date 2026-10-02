@@ -674,18 +674,18 @@ in arbitrary order.
 
 ### `refs`
 
-Generate a sibling Python module containing lightweight references for every
-top-level function declared with `@atask`, `@atask_queue`, or
-`@atask_broadcast`:
+Generate Python modules containing lightweight references for every top-level
+function declared with `@atask`, `@atask_queue`, or `@atask_broadcast`:
 
 ```bash
-atasks refs path/to/tasks.py [--module package.tasks]
+atasks refs source.py[=package.module] [source.py[=package.module] ...] \
+    [--output-dir generated | --output-file references.py]
 ```
 
-The command reads and parses the source file without importing it, then writes
-`path/to/tasks_refs.py`. The generated module imports `ataskref`, `atask_qref`,
-and `atask_bref` from `atasks.refs`, assigning each reference to the same Python
-function name as its declaration:
+The command reads and parses each source file without importing it. By default,
+it writes one sibling `<source>_refs.py` file per source. Each generated module
+imports `ataskref`, `atask_qref`, and `atask_bref` from `atasks.refs`, assigning
+each reference to the same Python function name as its declaration:
 
 ```python
 # tasks.py
@@ -712,8 +712,23 @@ For decorators without an explicit `name=`, the task name normally uses the
 source path relative to the current directory. Thus, when run from the project
 root, `atasks refs package/tasks.py` creates references named
 `package.tasks.<function>`, matching an `atasks service package.tasks` run from
-the same directory. Pass `--module package.tasks` to set that module portion
-explicitly, which is useful when the source path and import path differ.
+the same directory. Append `=package.tasks` to a source argument to set that
+module portion explicitly, which is useful when the source path and import
+path differ: `atasks refs path/to/tasks.py=package.tasks`. Each source may use
+its own override independently.
+
+By default, the generated file is written beside the source file. Pass
+`--output-dir generated` to write it below a separate output directory while
+preserving the source path relative to the current directory: for example,
+`atasks refs package/tasks.py --output-dir generated` writes
+`generated/package/tasks_refs.py`. Generated files begin with a comment that
+identifies the source and the generating command, and warns that the next run
+will overwrite manual changes.
+
+Pass `--output-file references.py` to combine references from every source into
+one file instead. `--output-file` and `--output-dir` cannot be used together.
+Each source must declare distinct Python function names when using
+`--output-file`, because the generated references share one module namespace.
 
 An explicit string `name=` or `namespace=` on the source decorator is preserved
 in the generated reference. `name=` and `namespace=` must be string literals so
