@@ -456,6 +456,56 @@ auto-delete queue:
   revisit this if it becomes a bottleneck - not something this package
   solves today.
 
+## Lightweight references - calling an atask by name alone
+
+`@atask`/`@atask_queue`/`@atask_broadcast` require the caller to import the
+module declaring the task, which pulls in that module's own dependencies too
+- fine when caller and callee share a codebase, wasteful when a caller (an
+API gateway, an admin tool, a generic dispatcher) only ever needs to invoke
+tasks by name and never implements any of them itself.
+
+`atasks.refs` provides one lightweight, import-free reference per atask kind
+- `ataskref`, `atask_qref`, `atask_bref` - matching `@atask`, `@atask_queue`,
+`@atask_broadcast` respectively:
+
+```python
+from atasks.refs import ataskref, atask_qref, atask_bref
+
+result = await ataskref['some_package.some_task'](42)     # RPC - waits for and returns the result
+await atask_qref['recalculate_rating'](contract_id)        # task-queue - fire-and-forget
+await atask_bref['relay_realtime_event'](payload)          # broadcast - fire-and-forget
+```
+
+Each behaves exactly like the coroutine the matching decorator would have
+produced, called by name instead of by import. Crucially, using one of these
+**registers nothing locally** - it never appears in `Router.activate()`'s
+subscriptions, so an instance that only ever calls `ataskref[...]` never ends
+up serving anything, and calling it after `router.activate(transport)` is
+always fine (there is no `LateRegistration` for a reference - only for a
+declaration).
+
+Call `ataskref(namespace=..., timeout=...)` (or `atask_qref(namespace=...)`/
+`atask_bref(namespace=...)`) to get a reusable reference bound to a
+non-default namespace:
+
+```python
+billing = ataskref(namespace='billing', timeout=10)
+invoice = await billing['create_invoice'](order_id)
+await billing['refund'](order_id)
+```
+
+`timeout` here is the *caller's* patience, independent of whatever default
+the callee's own `@atask(timeout=...)` may have set - see
+[Request timeout and combining `@atask` with `@backoff`](#request-timeout-and-combining-atask-with-backoff)
+above. `atask_qref`/`atask_bref` take no such option today - a task-queue or
+broadcast call never waits for a reply to time out on.
+
+The trade-off for skipping the import: a typo in the name is no longer
+caught by Python failing to find the function - it only surfaces at call
+time, as whatever error the transport raises for an unroutable/unserved
+name (e.g. `atasks.router.JobNotFound` on the receiving side, or a
+transport-specific error if nothing is listening at all).
+
 ## Delivery guarantees and idempotency - at-most-once, never exactly-once
 
 **All three patterns - `@atask` (RPC), `@atask_queue` (task-queue), and
