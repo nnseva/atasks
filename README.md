@@ -349,6 +349,12 @@ in time, the caller gets `atasks.transport.base.RequestTimeoutError` instead
 of waiting forever - see "When the worker evaluating `atask` is crashed"
 above for the full story, including connection-loss handling.
 
+With `AMQPTransport`, a request for a task name with no queue bound to its
+routing key fails immediately with `atasks.transport.base.NoRouteError`.
+This confirms that the broker could not route the request; it does not detect
+a bound queue that currently has no live consumer. Keep a response timeout for
+that case.
+
 Because `@atask` and `@backoff.on_exception(...)` are both just async-function
 decorators, they compose in either order for either purpose. The recommended
 shape for a function that runs remotely applies independent retry policies on
@@ -357,9 +363,9 @@ each side of the wire:
 ```python
 import backoff
 from atasks.tasks import atask
-from atasks.transport.base import ConnectionLostError, RequestTimeoutError
+from atasks.transport.base import ConnectionLostError, NoRouteError, RequestTimeoutError
 
-@backoff.on_exception(backoff.expo, (RequestTimeoutError, ConnectionLostError))  # retry the whole remote call - caller side
+@backoff.on_exception(backoff.expo, (NoRouteError, RequestTimeoutError, ConnectionLostError))  # retry the whole remote call - caller side
 @atask(timeout=30)
 @backoff.on_exception(backoff.expo, SomeTransientLocalError)  # retry the local execution - worker side
 async def some_processing_function(...):
@@ -373,6 +379,7 @@ async def some_processing_function(...):
   cross the wire.
 - The **caller-side** `@backoff.on_exception` retries the entire remote call -
   including a fresh `correlation_id` and reply-to round trip - when the
+    broker had no route for the request (`NoRouteError`), when the
   worker-side retries were exhausted, when the worker crashed outright
   (`ConnectionLostError` while a request was in flight, or the same
   `RequestTimeoutError` as a plain timeout, since - as noted above - a

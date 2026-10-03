@@ -25,7 +25,11 @@ from atasks.namespaces import namespaces
 from atasks.router import get_router
 from atasks.tasks import atask
 from atasks.transport.backends.amqp import AMQPTransport
-from atasks.transport.base import ConnectionLostError, RequestTimeoutError
+from atasks.transport.base import (
+    ConnectionLostError,
+    NoRouteError,
+    RequestTimeoutError,
+)
 from dev.tests._amqp_cleanup import teardown_amqp
 
 
@@ -116,21 +120,19 @@ class AMQPRPCTest(TestCase):
         with self.assertRaises(ValueError):
             await boom()
 
-    async def test_003_timeout_when_no_worker(self):
-        """A call whose worker never responds (never registered, or crashed) must
-        raise RequestTimeoutError after the configured timeout, not hang forever."""
+    async def test_003_no_route_when_no_worker(self):
+        """An unregistered task has no bound queue and fails immediately."""
         namespace = self.namespace
 
-        @atask(namespace=namespace, timeout=1)
+        @atask(namespace=namespace, timeout=30)
         async def never_answered():
             return 'unreachable'  # never actually registered/served on server_transport
 
         loop = asyncio.get_event_loop()
         start = loop.time()
-        with self.assertRaises(RequestTimeoutError):
+        with self.assertRaises(NoRouteError):
             await never_answered()
         elapsed = loop.time() - start
-        self.assertGreaterEqual(elapsed, 1)
         self.assertLess(elapsed, 5)
 
     async def test_004_slow_worker_times_out(self):
@@ -175,26 +177,38 @@ class AMQPRPCTest(TestCase):
         client_transport = AMQPTransport(namespace=namespace, url=AMQP_URL, prefix=namespace)
         await client_transport.connect()
 
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        handler_finished = asyncio.Event()
+
         @atask(namespace=namespace, timeout=30)
         async def never_answered_either():
-            return 'unreachable'
+            handler_started.set()
+            try:
+                await release_handler.wait()
+            finally:
+                handler_finished.set()
+
+        router = get_router(namespace)
+        await router.activate(self.server_transport)
 
         # Fire the request in the background using a dedicated router/transport pair,
         # then kill the underlying connection via the management API mid-flight.
         call_task = asyncio.ensure_future(never_answered_either())
-
-        target_name = await self._find_new_connection_name(before_names, attempts=30, delay=0.5)
-        if target_name is None:
-            call_task.cancel()
-            await client_transport.disconnect()
-            self.skipTest('Could not identify the new AMQP connection via the management API')
-
-        await self._close_connection(target_name)
+        await asyncio.wait_for(handler_started.wait(), timeout=2)
 
         try:
+            target_name = await self._find_new_connection_name(before_names, attempts=30, delay=0.5)
+            if target_name is None:
+                self.skipTest('Could not identify the new AMQP connection via the management API')
+
+            await self._close_connection(target_name)
+
             with self.assertRaises(ConnectionLostError):
                 await asyncio.wait_for(call_task, timeout=10)
         finally:
+            release_handler.set()
+            await asyncio.wait_for(handler_finished.wait(), timeout=2)
             await client_transport.disconnect()
 
     async def _list_connection_names(self):
@@ -270,10 +284,9 @@ class AMQPRPCTest(TestCase):
 
         # Now verify caller-side stacking with a *real* race, not a simulated one:
         # the worker only starts serving requests after a short delay (as if it
-        # were still starting up / recovering from a crash), so the first couple
-        # of real @atask calls genuinely time out over the wire before
-        # backoff.on_exception on the *caller* side retries the whole call and it
-        # eventually reaches the now-available worker and succeeds.
+        # were still starting up / recovering from a crash), so the first calls
+        # fail with NoRouteError before the binding exists. Caller-side backoff
+        # retries the whole call and it eventually reaches the worker.
         #
         # Registering a new @atask requires the router to not be active (see
         # Router.activate/LateRegistration) - deactivate the first part's
@@ -297,7 +310,10 @@ class AMQPRPCTest(TestCase):
 
         activation = asyncio.ensure_future(_activate_after_delay())
 
-        @backoff.on_exception(backoff.constant, RequestTimeoutError, max_tries=5, interval=0.1)
+        @backoff.on_exception(
+            backoff.constant, (NoRouteError, RequestTimeoutError),
+            max_tries=5, interval=0.2, jitter=None,
+        )
         async def call_with_retry(x):
             return await becomes_available_late(x)
 

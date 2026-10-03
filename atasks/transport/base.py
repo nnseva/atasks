@@ -43,6 +43,17 @@ class UnknownRequestName(Exception):
     """
 
 
+class NoRouteError(Exception):
+    """
+    Raised by a broker-backed RPC transport when a request cannot be routed
+    to any queue.
+
+    Unlike :class:`RequestTimeoutError`, this is an immediate confirmation
+    from the broker that no queue is bound for the requested task name. It
+    does not imply that a currently registered queue has a live consumer.
+    """
+
+
 class ConnectionLostError(ConnectionError):
     """
     Raised for every RPC (``@atask``) request currently in flight when the
@@ -122,6 +133,7 @@ class Transport(object):
         :returns: response to the request
         :rtype: bytes
         :raises RequestTimeoutError: if no response arrives within ``timeout`` seconds
+        :raises NoRouteError: if the request cannot be routed to any queue
         :raises ConnectionLostError: if the connection to the broker is lost while waiting
         """
         raise NotImplementedError()

@@ -1,1 +1,1 @@
-aio-pika
+aio-pika>=9.6.2
