@@ -436,6 +436,8 @@ class AMQPTransport(Transport):
                     aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
                     routing_key=routing_key,
                 )
+            except aio_pika.exceptions.PublishError:
+                logger.debug('Dropped event for %s because it has no declared queue', name)
             except asyncio.CancelledError as exc:
                 if self._task_was_actually_cancelled():
                     raise
@@ -502,6 +504,8 @@ class AMQPTransport(Transport):
                     aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
                     routing_key=routing_key,
                 )
+            except aio_pika.exceptions.PublishError:
+                logger.debug('Dropped broadcast for %s because it has no active subscribers', name)
             except asyncio.CancelledError as exc:
                 if self._task_was_actually_cancelled():
                     raise
