@@ -29,7 +29,6 @@ ATASKS_TEST_AMQP_URL (default amqp://guest:guest@localhost/) for
 ``RunAMQPShutdownTest`` only. Those tests are skipped (not failed) if no
 broker is reachable.
 """
-import asyncio
 import os
 import signal
 import subprocess
@@ -37,7 +36,7 @@ import sys
 import time
 from unittest import IsolatedAsyncioTestCase as TestCase
 
-import aio_pika
+from dev.tests._amqp_environment import require_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -54,15 +53,6 @@ BAD_PATTERNS = (
 )
 
 READY_PATTERN = 'Listening for requests'
-
-
-async def _check_broker_reachable():
-    try:
-        connection = await asyncio.wait_for(aio_pika.connect(AMQP_URL), timeout=2)
-        await connection.close()
-        return True
-    except Exception:
-        return False
 
 
 def _run_atasks(*namespace_specs, extra_args=()):
@@ -125,9 +115,9 @@ class RunAMQPShutdownTest(TestCase):
     """``python -m atasks.commands.service ... transport=amqp`` must exit cleanly, with no leftover tasks."""
 
     async def asyncSetUp(self):
-        """Skip when no broker is reachable, rather than failing every test."""
-        if not await _check_broker_reachable():
-            self.skipTest('No AMQP broker reachable at %s' % AMQP_URL)
+        """Require AMQP unless this integration group was explicitly disabled."""
+        if not await require_amqp():
+            self.skipTest('AMQP integration tests explicitly disabled by ATASKS_SKIP_AMQP_TESTS=1')
 
     def test_001_client_namespace_no_scenario_shuts_down_cleanly(self):
         """A 'client' namespace with zero scenarios still connects the transport -

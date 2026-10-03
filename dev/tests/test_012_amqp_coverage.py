@@ -30,11 +30,10 @@ from unittest import IsolatedAsyncioTestCase as TestCase
 from urllib import request as urlrequest
 from urllib.error import URLError
 
-import aio_pika
-
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import ConnectionLostError, RequestTimeoutError
 from dev.tests._amqp_cleanup import teardown_amqp
+from dev.tests._amqp_environment import require_amqp, require_management_api
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -55,21 +54,13 @@ def _fresh_namespace():
     return 'test-amqp-coverage-%s' % uuid.uuid4().hex
 
 
-async def _check_broker_reachable():
-    try:
-        connection = await asyncio.wait_for(aio_pika.connect(AMQP_URL), timeout=2)
-        await connection.close()
-        return True
-    except Exception:
-        return False
-
-
 class AMQPCoverageTest(TestCase):
     """Exercises error/edge branches in AMQPTransport that the rest of dev/tests never reach."""
 
     async def asyncSetUp(self):
-        if not await _check_broker_reachable():
-            self.skipTest('No AMQP broker reachable at %s' % AMQP_URL)
+        if not await require_amqp():
+            self.skipTest('AMQP integration tests explicitly disabled by ATASKS_SKIP_AMQP_TESTS=1')
+        await require_management_api()
         self.namespace = _fresh_namespace()
         self._cleanup_transports = []
 
@@ -469,14 +460,14 @@ class AMQPCoverageTest(TestCase):
         automatic reconnect must eventually fire _on_reconnected."""
         before_names = await self._list_connection_names()
         if before_names is None:
-            self.skipTest('RabbitMQ management API not reachable at %s' % MANAGEMENT_URL)
+            self.fail('RabbitMQ management API became unavailable at %s' % MANAGEMENT_URL)
         await asyncio.sleep(6)
         before_names = await self._list_connection_names()
 
         await self._new_transport()
         connection_name = await self._find_new_connection_name(before_names)
         if connection_name is None:
-            self.skipTest("Could not identify the transport's AMQP connection via the management API")
+            self.fail("Could not identify the transport's AMQP connection via the management API")
 
         with self.assertLogs('atasks.transport.backends.amqp', level='INFO') as logs:
             await self._close_connection(connection_name)

@@ -29,8 +29,8 @@ turn green once the AMQP transport normalizes connection failures to
 ``ConnectionLostError`` uniformly.
 
 Requires a reachable RabbitMQ (or other AMQP 0-9-1 broker) at ATASKS_TEST_AMQP_URL
-(default amqp://guest:guest@localhost/). Tests are skipped (not failed) if no
-broker is reachable.
+(default amqp://guest:guest@localhost/). An unavailable broker fails the test
+unless AMQP tests were explicitly disabled with ATASKS_SKIP_AMQP_TESTS=1.
 """
 import asyncio
 import os
@@ -38,14 +38,13 @@ import time
 import uuid
 from unittest import IsolatedAsyncioTestCase as TestCase
 
-import aio_pika
-
 from atasks.codecs import PickleCodec
 from atasks.router import get_router
 from atasks.tasks import atask
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import ConnectionLostError
 from dev.tests._amqp_cleanup import teardown_amqp
+from dev.tests._amqp_environment import require_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -65,21 +64,12 @@ def _fresh_namespace():
     return 'test-amqp-reconnect-%s' % uuid.uuid4().hex
 
 
-async def _check_broker_reachable():
-    try:
-        connection = await asyncio.wait_for(aio_pika.connect(AMQP_URL), timeout=2)
-        await connection.close()
-        return True
-    except Exception:
-        return False
-
-
 class AMQPReconnectTest(TestCase):
     """Connection-loss-after-idle handling in the AMQP transport"""
 
     async def asyncSetUp(self):
-        if not await _check_broker_reachable():
-            self.skipTest('No AMQP broker reachable at %s' % AMQP_URL)
+        if not await require_amqp():
+            self.skipTest('AMQP integration tests explicitly disabled by ATASKS_SKIP_AMQP_TESTS=1')
         self.namespace = _fresh_namespace()
         PickleCodec(namespace=self.namespace)
         self._cleanup_transports = []
