@@ -6,8 +6,6 @@ import os
 import uuid
 from unittest import IsolatedAsyncioTestCase as TestCase
 
-import aio_pika
-
 import atasks
 from atasks import trace
 from atasks.codecs import PickleCodec
@@ -16,6 +14,7 @@ from atasks.tasks import atask, atask_broadcast, atask_queue
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import LoopbackTransport
 from dev.tests._amqp_cleanup import teardown_amqp
+from dev.tests._amqp_environment import require_amqp
 
 
 AMQP_URL = os.environ.get('ATASKS_TEST_AMQP_URL', 'amqp://guest:guest@localhost/')
@@ -28,16 +27,6 @@ ATASKS_PACKAGE_DIR = os.path.dirname(os.path.abspath(atasks.__file__))
 def _fresh_namespace():
     """Every test gets its own namespace so registries/routers/transports never collide."""
     return 'test-trace-%s' % uuid.uuid4().hex
-
-
-async def _check_broker_reachable():
-    """True if an AMQP broker answers at AMQP_URL within 2 seconds"""
-    try:
-        connection = await asyncio.wait_for(aio_pika.connect(AMQP_URL), timeout=2)
-        await connection.close()
-        return True
-    except Exception:
-        return False
 
 
 async def _raise_after_await(x):
@@ -371,9 +360,9 @@ class AMQPTraceTest(TestCase):
     """
 
     async def asyncSetUp(self):
-        """Skip the whole test case if no broker is reachable"""
-        if not await _check_broker_reachable():
-            self.skipTest('No AMQP broker reachable at %s' % AMQP_URL)
+        """Require AMQP unless this integration group was explicitly disabled."""
+        if not await require_amqp():
+            self.skipTest('AMQP integration tests explicitly disabled by ATASKS_SKIP_AMQP_TESTS=1')
 
     async def test_001_trace_survives_a_real_amqp_round_trip(self):
         """The AtaskHop/AtaskTrace/FrameInfo dataclasses must be picklable and

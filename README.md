@@ -2,6 +2,18 @@
 
 ATasks is an asynchronous distributed task queue system.
 
+## Testing
+
+AMQP integration tests require a reachable broker and RabbitMQ Management API
+with permission to close connections. `tox -e integration` validates those
+requirements before running the suite and fails when they are not met.
+
+Use `tox -e unit` for an intentional broker-free run. It sets
+`ATASKS_SKIP_AMQP_TESTS=1`, the sole supported reason for AMQP test skips.
+The broker URL and management credentials can be supplied through
+`ATASKS_TEST_AMQP_URL`, `ATASKS_TEST_AMQP_MANAGEMENT_URL`,
+`ATASKS_TEST_AMQP_MANAGEMENT_USER`, and `ATASKS_TEST_AMQP_MANAGEMENT_PASSWORD`.
+
 Every task is defined as an asynchronous coroutine. We call such a task `atask`:
 a(synchronous) task.
 
