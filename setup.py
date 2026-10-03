@@ -30,6 +30,11 @@ setup(
     ],
     platforms='any',
     install_requires=requirements,
+    entry_points={
+        'console_scripts': [
+            'atasks = atasks.cli:main',
+        ],
+    },
     extras_require={
         'test': [
             'flake8',

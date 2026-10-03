@@ -555,14 +555,24 @@ the use case needs it at all - the delivery mechanism itself won't help.
 
 ## Commands
 
-The package provides a command-line interface through the `atasks.run` module.
+The package provides a command-line interface through the `atasks` command:
+
+```bash
+atasks <command> [options]
+```
+
+Use `atasks help` to display the top-level command reference.
+
+### `service`
 
 Run one or more files or Python modules containing `@atask` definitions and an
 optional asynchronous `aiomain` coroutine:
 
 ```bash
-python -m atasks.run file-or-module [file-or-module ...] [options]
+atasks service file-or-module [file-or-module ...] [options]
 ```
+
+The equivalent module invocation is `python -m atasks.service`.
 
 Each referenced file or module is loaded once, regardless of how many
 namespaces it registers `@atask`s into (see [Namespaces](#namespaces)). If it
@@ -570,7 +580,7 @@ defines `aiomain`, that coroutine is evaluated; parsed command-line options
 (including the parsed `-N`/`--namespace` list, see below) are passed to it as
 keyword arguments - see `dev/tests/scenarios.py` for an example.
 
-### Namespaces on the command line
+#### Namespaces on the command line
 
 Every namespace the run is meant to touch - even a single one - is configured
 with its own `-N`/`--namespace SPEC`, repeatable, one per namespace. `SPEC` is
@@ -599,21 +609,21 @@ Omitting `-N`/`--namespace` entirely is equivalent to a single
 transport in the loopback (default) mode:
 
 ```bash
-python -m atasks.run dev.tests.scenarios --verbosity 3
+atasks service dev.tests.scenarios --verbosity 3
 ```
 
 A `server` mode paired with the `amqp` transport lets one process act
 as both server and client for that namespace, and wait for incoming requests:
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=server,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=server,transport=amqp --verbosity 3
 ```
 
 A `client` mode paired with the `amqp` transport lets one process act
 as a pure client, executing it's `aiomain()` function to request server(s):
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=client,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=client,transport=amqp --verbosity 3
 ```
 
 A `loopback` mode is similar to the `loopback` mode, but doesn't wait for incoming
@@ -621,7 +631,7 @@ requests, just executes `aiomain()` and exits:
 
 
 ```bash
-python -m atasks.run dev.tests.scenarios -N mode=loopback,transport=amqp --verbosity 3
+atasks service dev.tests.scenarios -N mode=loopback,transport=amqp --verbosity 3
 ```
 
 You can use the `loopback` mode to create necessary durable AMQP queues before the service is deployed for the very first time on this AMQP server (see also [AMQP Transport Topology](AMQP-TRANSPORT-TOPOLOGY.md))
@@ -630,7 +640,7 @@ Several independent namespaces, each with its own transport/mode, in one
 process:
 
 ```bash
-python -m atasks.run my_scenarios.py \
+atasks service my_scenarios.py \
     -N name=orders,mode=server,transport=amqp,url=amqp://broker/,hostname=worker-1 \
     -N name=billing,mode=client,transport=amqp,url=amqp://broker/
 ```
@@ -644,7 +654,7 @@ Other options, independent of any namespace:
 Run the module with `--help` to see the complete command-line reference:
 
 ```bash
-python -m atasks.run --help
+atasks service --help
 ```
 
 Note that if you use a dedicated `server` process instance reached from
@@ -661,6 +671,78 @@ enlisting them all in the command line.
 
 You can start several server process instances, the client will then request them
 in arbitrary order.
+
+### `refs`
+
+Generate Python modules containing lightweight references for every top-level
+function declared with `@atask`, `@atask_queue`, or `@atask_broadcast`:
+
+```bash
+atasks refs source.py[=package.module] [source.py[=package.module] ...] \
+    [--output-dir generated | --output-file references.py]
+```
+
+The command reads and parses each source file without importing it. By default,
+it writes one sibling `<source>_refs.py` file per source. Each generated module
+imports `ataskref`, `atask_qref`, and `atask_bref` from `atasks.refs`, assigning
+each reference to the same Python function name as its declaration:
+
+```python
+# tasks.py
+from atasks.tasks import atask, atask_queue
+
+@atask
+async def add(left, right):
+    ...
+
+@atask_queue(namespace='workers')
+async def send_email(message):
+    ...
+```
+
+```python
+# tasks_refs.py
+from atasks.refs import atask_bref, atask_qref, ataskref
+
+add = ataskref['package.tasks.add']
+send_email = atask_qref(namespace='workers')['package.tasks.send_email']
+```
+
+For decorators without an explicit `name=`, the task name normally uses the
+source path relative to the current directory. Thus, when run from the project
+root, `atasks refs package/tasks.py` creates references named
+`package.tasks.<function>`, matching an `atasks service package.tasks` run from
+the same directory. Append `=package.tasks` to a source argument to set that
+module portion explicitly, which is useful when the source path and import
+path differ: `atasks refs path/to/tasks.py=package.tasks`. Each source may use
+its own override independently.
+
+By default, the generated file is written beside the source file. Pass
+`--output-dir generated` to write it below a separate output directory while
+preserving the source path relative to the current directory: for example,
+`atasks refs package/tasks.py --output-dir generated` writes
+`generated/package/tasks_refs.py`. Generated files begin with a comment that
+identifies the source and the generating command, and warns that the next run
+will overwrite manual changes.
+
+Pass `--output-file references.py` to combine references from every source into
+one file instead. `--output-file` and `--output-dir` cannot be used together.
+Each source must declare distinct Python function names when using
+`--output-file`, because the generated references share one module namespace.
+
+An explicit string `name=` or `namespace=` on the source decorator is preserved
+in the generated reference. `name=` and `namespace=` must be string literals so
+the command can determine them without executing the source module.
+
+### `help`
+
+Display the top-level command reference:
+
+```bash
+atasks help
+```
+
+This is equivalent to `atasks --help`.
 
 ## Inspiration
 
@@ -770,7 +852,7 @@ Router(
 )
 ```
 
-`run.py` exposes these as the `hostname`, `max-trace-depth`, `trace-filter-modules`
+`service.py` exposes these as the `hostname`, `max-trace-depth`, `trace-filter-modules`
 and `collect-await-frames` keys of its per-namespace `-N`/`--namespace SPEC` -
 see [Commands](#commands).
 
@@ -825,5 +907,5 @@ There isn't a dedicated synchronous API, and none is planned - `atask` is an
 `async def` coroutine like any other, so use it the same way you would use
 any other coroutine from synchronous code: `asyncio.run(some_task(...))` (or
 `loop.run_until_complete(...)` if you already manage your own loop). See
-`atasks/run.py` for exactly this pattern (`aiomain` is invoked via
+`atasks/service.py` for exactly this pattern (`aiomain` is invoked via
 `loop.run_until_complete`).

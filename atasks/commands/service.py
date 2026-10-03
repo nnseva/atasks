@@ -11,13 +11,10 @@ import signal
 import sys
 
 
-# Not logging.getLogger(__name__): this module is meant to be run as
-# `python -m atasks.run`, which makes __name__ '__main__' rather than
-# 'atasks.run' - decoupled from the 'atasks' logger hierarchy that -L/
-# --loggers (and its 'atasks' default) configures below, so every log call in
-# this file would otherwise be silently dropped by logging's lastResort
-# handler (WARNING+ only, straight to stderr) whenever actually run that way.
-logger = logging.getLogger('atasks.run')
+if __name__ == '__main__':
+    logger = logging.getLogger('atasks.command.service')
+else:
+    logger = logging.getLogger(__name__)
 
 exit_run = False
 
@@ -237,9 +234,16 @@ def sig_handler(sig_num, stack_frame):
     exit_run = True
 
 
-def main(argv):
+def main(argv=None):
     """Module main"""
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+    if argv is None:
+        argv = sys.argv
+
+    parser = argparse.ArgumentParser(
+        prog=argv[0],
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Run task service scenario modules and serve their declared tasks"
+    )
     parser.add_argument(
         'scenario',
         nargs='*',
@@ -374,5 +378,5 @@ for the full reference and examples.
 
 
 if __name__ == '__main__':
-    sys.path.insert(0, '.')
+    sys.path.insert(0, '..')
     main(sys.argv)

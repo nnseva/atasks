@@ -1,5 +1,5 @@
 """
-Regression tests for ``python -m atasks.run`` process shutdown.
+Regression tests for ``python -m atasks.commands.service`` process shutdown.
 
 Before the fix, ``aiomain()`` connected the configured transport but never
 disconnected it again - not even when there was nothing else to do (no
@@ -11,13 +11,13 @@ were torn down out of order instead of shut down cleanly, which surfaced as
 "no running event loop" noise on stderr - even for a run with zero
 scenarios. See the reported repro (pre-multi-namespace CLI):
 
-    python -m atasks.run -v 4 -M client -T amqp
+    python -m atasks.commands.service -v 4 -M client -T amqp
 
 ``RunAMQPShutdownTest`` runs the real command as a subprocess (exactly like
 the repro) against a real broker and asserts none of that noise appears, for
 a 'client' namespace (no activation at all) and for a 'server' one (activated,
 then shut down via a real OS signal - the only way to end a 'server'
-namespace's "Listening for requests" wait, see atasks/run.py's aiomain()).
+namespace's "Listening for requests" wait, see atasks/service.py's aiomain()).
 
 ``RunMultiNamespaceListeningTest`` covers the core multi-namespace rule
 itself - the process must enter "Listening for requests" as soon as *any*
@@ -66,10 +66,10 @@ async def _check_broker_reachable():
 
 
 def _run_atasks(*namespace_specs, extra_args=()):
-    """Run ``python -m atasks.run`` to completion (no 'server' namespace among
+    """Run ``python -m atasks.commands.service`` to completion (no 'server' namespace among
     ``namespace_specs``, so it's expected to return on its own) and return the
     finished ``subprocess.CompletedProcess``."""
-    args = [sys.executable, '-m', 'atasks.run', '-v', '4']
+    args = [sys.executable, '-m', 'atasks.commands.service', '-v', '4']
     for spec in namespace_specs:
         args += ['-N', spec]
     args += list(extra_args)
@@ -78,7 +78,7 @@ def _run_atasks(*namespace_specs, extra_args=()):
 
 def _run_server_until_signaled(*namespace_specs, extra_args=(), timeout=15):
     """
-    Spawn ``python -m atasks.run`` with the given -N specs (at least one
+    Spawn ``python -m atasks.commands.service`` with the given -N specs (at least one
     'server' among them), wait until it logs READY_PATTERN - proving it
     actually reached the "Listening for requests" wait loop - then send it
     SIGTERM, exactly as an operator/orchestrator would to stop the service.
@@ -86,7 +86,7 @@ def _run_server_until_signaled(*namespace_specs, extra_args=(), timeout=15):
     :returns: (returncode, combined stderr, stdout) of the finished process
     :raises AssertionError: if READY_PATTERN never appears within ``timeout``
     """
-    args = [sys.executable, '-m', 'atasks.run', '-v', '4']
+    args = [sys.executable, '-m', 'atasks.commands.service', '-v', '4']
     for spec in namespace_specs:
         args += ['-N', spec]
     args += list(extra_args)
@@ -122,7 +122,7 @@ def _run_server_until_signaled(*namespace_specs, extra_args=(), timeout=15):
 
 
 class RunAMQPShutdownTest(TestCase):
-    """``python -m atasks.run ... transport=amqp`` must exit cleanly, with no leftover tasks."""
+    """``python -m atasks.commands.service ... transport=amqp`` must exit cleanly, with no leftover tasks."""
 
     async def asyncSetUp(self):
         """Skip when no broker is reachable, rather than failing every test."""

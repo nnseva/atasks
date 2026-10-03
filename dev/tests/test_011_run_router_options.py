@@ -1,5 +1,5 @@
 """
-Tests for ``atasks.run``'s -N/--namespace SPEC parsing (``_parse_namespace_spec``)
+Tests for ``atasks.commands.service``'s -N/--namespace SPEC parsing (``_parse_namespace_spec``)
 and for how ``main()``/``aiomain()`` translate a parsed SPEC into the matching
 :class:`atasks.router.Router` constructor arguments for its namespace -
 ``hostname``, ``max-trace-depth``, ``trace-filter-modules`` and
@@ -18,8 +18,8 @@ signal/subprocess machinery needed.
 import uuid
 from unittest import TestCase
 
+from atasks.commands.service import _parse_namespace_spec, main
 from atasks.router import get_router
-from atasks.run import _parse_namespace_spec, main
 
 
 def _fresh_namespace():
@@ -101,11 +101,11 @@ class RunRouterOptionsTest(TestCase):
 
     def test_no_router_keys_leaves_router_defaults(self):
         """With none of hostname/max-trace-depth/trace-filter-modules/
-        collect-await-frames given, run.py must not construct a Router itself
+        collect-await-frames given, service.py must not construct a Router itself
         at all - get_router() is left to lazily create one with the
         constructor's own defaults."""
         namespace = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s' % namespace])
+        main(['service.py', '-N', 'name=%s' % namespace])
 
         router = get_router(namespace)
         self.assertEqual(router.namespace, namespace)
@@ -115,31 +115,31 @@ class RunRouterOptionsTest(TestCase):
 
     def test_hostname_reaches_the_router(self):
         namespace = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,hostname=custom-host' % namespace])
+        main(['service.py', '-N', 'name=%s,hostname=custom-host' % namespace])
 
         self.assertEqual(get_router(namespace).hostname, 'custom-host')
 
     def test_max_trace_depth_reaches_the_router(self):
         namespace = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,max-trace-depth=5' % namespace])
+        main(['service.py', '-N', 'name=%s,max-trace-depth=5' % namespace])
 
         self.assertEqual(get_router(namespace).max_trace_depth, 5)
 
     def test_trace_filter_modules_reaches_the_router(self):
         namespace = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,trace-filter-modules=atasks:backoff' % namespace])
+        main(['service.py', '-N', 'name=%s,trace-filter-modules=atasks:backoff' % namespace])
 
         self.assertEqual(get_router(namespace).trace_filter_modules, ('atasks', 'backoff'))
 
     def test_collect_await_frames_can_be_disabled(self):
         namespace = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,collect-await-frames=false' % namespace])
+        main(['service.py', '-N', 'name=%s,collect-await-frames=false' % namespace])
 
         self.assertFalse(get_router(namespace).collect_await_frames)
 
     def test_all_router_keys_reach_the_router_together(self):
         namespace = _fresh_namespace()
-        main(['run.py', '-N', (
+        main(['service.py', '-N', (
             'name=%s,hostname=custom-host,max-trace-depth=7,'
             'trace-filter-modules=atasks,collect-await-frames=false'
         ) % namespace])
@@ -156,8 +156,8 @@ class RunRouterOptionsTest(TestCase):
         namespace's own (independently defaulted or configured) Router."""
         customized = _fresh_namespace()
         untouched = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,max-trace-depth=3,collect-await-frames=false' % customized])
-        main(['run.py', '-N', 'name=%s' % untouched])
+        main(['service.py', '-N', 'name=%s,max-trace-depth=3,collect-await-frames=false' % customized])
+        main(['service.py', '-N', 'name=%s' % untouched])
 
         self.assertEqual(get_router(customized).max_trace_depth, 3)
         self.assertFalse(get_router(customized).collect_await_frames)
@@ -167,7 +167,7 @@ class RunRouterOptionsTest(TestCase):
     def test_no_namespace_flag_at_all_defaults_to_default_namespace(self):
         """Omitting -N/--namespace entirely still runs exactly one namespace,
         named 'default', client mode, loopback transport."""
-        main(['run.py'])
+        main(['service.py'])
 
         router = get_router('default')
         self.assertEqual(router.namespace, 'default')
@@ -175,7 +175,7 @@ class RunRouterOptionsTest(TestCase):
     def test_multiple_namespaces_get_independent_routers(self):
         first = _fresh_namespace()
         second = _fresh_namespace()
-        main(['run.py', '-N', 'name=%s,max-trace-depth=11' % first, '-N', 'name=%s,max-trace-depth=22' % second])
+        main(['service.py', '-N', 'name=%s,max-trace-depth=11' % first, '-N', 'name=%s,max-trace-depth=22' % second])
 
         self.assertEqual(get_router(first).max_trace_depth, 11)
         self.assertEqual(get_router(second).max_trace_depth, 22)
@@ -183,4 +183,4 @@ class RunRouterOptionsTest(TestCase):
     def test_duplicate_namespace_name_is_rejected(self):
         namespace = _fresh_namespace()
         with self.assertRaises(SystemExit):
-            main(['run.py', '-N', 'name=%s' % namespace, '-N', 'name=%s,mode=client' % namespace])
+            main(['service.py', '-N', 'name=%s' % namespace, '-N', 'name=%s,mode=client' % namespace])

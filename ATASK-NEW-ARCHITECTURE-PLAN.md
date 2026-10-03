@@ -342,7 +342,7 @@ async def _unregister_request_callback(self, name):
 
 ---
 
-## 5. `atasks/run.py`
+## 5. `atasks/service.py`
 
 **Критично**: сейчас `aiomain()` вызывает `router.activate(transport)`
 _до_ загрузки модулей сценария (`scenario`), а именно в них лежат
@@ -434,6 +434,6 @@ _до_ загрузки модулей сценария (`scenario`), а име�
    `disconnect()`.
 4. `router.py` — три реестра, `LateRegistration`, переработанные
    `activate()`/`deactivate()`, удаление публичных `activate_queue` и т.п.
-5. `run.py` — порядок импорта сценария относительно `activate()`.
+5. `service.py` — порядок импорта сценария относительно `activate()`.
 6. Тесты — по каждому пункту выше, плюс регрессионный тест изоляции.
 7. `README.md` + новый `AMQP-TRANSPORT-TOPOLOGY.md`.
