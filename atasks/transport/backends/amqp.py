@@ -6,6 +6,7 @@ import aio_pika
 
 from atasks.transport.base import (
     ConnectionLostError,
+    NoRouteError,
     RequestTimeoutError,
     Transport,
 )
@@ -155,7 +156,7 @@ class AMQPTransport(Transport):
             )
             self._connection.close_callbacks.add(self._on_connection_closed)
             self._connection.reconnect_callbacks.add(self._on_reconnected)
-            self._channel = await self._connection.channel()
+            self._channel = await self._connection.channel(on_return_raises=True)
 
             # All four exchanges are plain durable topics, and their names are
             # free to coincide (they default to the same 'atask') - it's the
@@ -372,6 +373,9 @@ class AMQPTransport(Transport):
                     ),
                     routing_key=self._request_routing_prefix + name,
                 )
+            except aio_pika.exceptions.PublishError:
+                self._awaiting_requests.pop(correlation_id, None)
+                raise NoRouteError(name) from None
             except asyncio.CancelledError as exc:
                 if self._task_was_actually_cancelled():
                     # A real cancellation propagates untouched, but nothing past
@@ -432,6 +436,8 @@ class AMQPTransport(Transport):
                     aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
                     routing_key=routing_key,
                 )
+            except aio_pika.exceptions.PublishError:
+                logger.debug('Dropped event for %s because it has no declared queue', name)
             except asyncio.CancelledError as exc:
                 if self._task_was_actually_cancelled():
                     raise
@@ -498,6 +504,8 @@ class AMQPTransport(Transport):
                     aio_pika.Message(body=content, delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
                     routing_key=routing_key,
                 )
+            except aio_pika.exceptions.PublishError:
+                logger.debug('Dropped broadcast for %s because it has no active subscribers', name)
             except asyncio.CancelledError as exc:
                 if self._task_was_actually_cancelled():
                     raise

@@ -159,3 +159,23 @@ class AMQPQueueTest(TestCase):
         await worker._register_event_callback(name, _handle)
         await asyncio.wait_for(got_it.wait(), timeout=5)
         self.assertEqual(received, ['queued-before-consumer'])
+
+    async def test_004_publish_before_queue_exists_is_dropped(self):
+        """An event for a never-declared queue is fire-and-forget and has no replay."""
+        name = 'never.declared'
+        publisher = await self._new_transport()
+        await publisher.publish_event(name, b'before-queue-exists')
+
+        worker = await self._new_transport()
+        received = []
+
+        async def _handle(content):
+            received.append(content.decode())
+
+        await worker._register_event_callback(name, _handle)
+        await asyncio.sleep(0.3)
+
+        await publisher.publish_event(name, b'after-queue-exists')
+        await asyncio.sleep(0.5)
+
+        self.assertEqual(received, ['after-queue-exists'])
