@@ -429,11 +429,13 @@ several) competing consumers simply by having imported the module with the
 [Client and Server](#client-and-server) above; there is no separate
 per-task-queue activation call to make.
 
-Every instance whose `@atask_queue` shares the same name ends up bound to
-the *same* durable, named queue - so they compete, and every published event
-is delivered to exactly one of them, never to more than one, and never lost
-even if published before any consumer has started (the queue is declared
-durably by the publisher too).
+Every instance whose `@atask_queue` shares the same name uses the *same*
+durable, named queue - so active consumers compete, and a message in that
+queue is delivered to one consumer, not broadcast to all of them. The queue
+is declared when a consumer registers, not by the publisher. Consequently,
+an event published before the queue has ever been declared has no route and
+is dropped; once declared, the durable queue can retain messages while no
+consumer is active.
 
 ## Broadcast/subscribe (fire-and-forget, fan-out)
 
@@ -525,52 +527,57 @@ time, as whatever error the transport raises for an unroutable/unserved
 name (e.g. `atasks.router.JobNotFound` on the receiving side, or a
 transport-specific error if nothing is listening at all).
 
-## Delivery guarantees and idempotency - at-most-once, never exactly-once
+## AMQP delivery semantics, acknowledgements, and idempotency
 
-**All three patterns - `@atask` (RPC), `@atask_queue` (task-queue), and
-`@atask_broadcast` (broadcast) - are at-most-once at the message-delivery
-level, not at-least-once.** Every message is acknowledged to the broker as
-soon as it is *received*, before the registered handler ever runs - an
-architectural constraint, not an oversight: see the comment above
-`_on_message` in `atasks/transport/backends/amqp.py` for why deferring the
-ack until the handler finishes isn't safe here (a single transport's RPC
-consumer shares one AMQP prefetch slot across every task name it serves, and
-delaying the ack that long deadlocks on any nested/self-referential call
-chain - one task's handler calling another task the same worker also
-serves). The practical consequence: **if the process handling a message
-crashes, is killed, or loses its connection while the handler is still
-running, that message is gone.** AMQP will not redeliver it to another
-consumer, and nothing else will ever be told the work didn't happen.
+Do not treat a successful publish as proof that a handler ran, or a failed
+publish as proof that it did not. These are separate stages:
 
-- For RPC (`@atask`), this loss is at least observable from the caller's
-  side: `send_request` is still waiting on a reply that will now never
-  arrive, so it surfaces as `RequestTimeoutError` (or `ConnectionLostError`,
-  if the connection itself drops - see "When the worker evaluating `atask`
-  is crashed" below). If the call site follows the documented caller-side
-  `backoff.on_exception` pattern, that retry re-issues a brand-new request -
-  which can end up running the underlying function twice (if the crashed
-  worker had actually finished the work moments before dying, just never got
-  to reply) rather than exactly once. This retry is an application-level
-  convention this package documents and expects you to add - not something
-  AMQP or this library provides automatically.
-- For `@atask_queue`/`@atask_broadcast`, there is no caller waiting for
-  anything to compare against: `publish_event`/`publish_broadcast` return as
-  soon as the message is handed to the broker, with no confirmation that it
-  was ever processed. If the consumer that picked it up then crashes
-  mid-handler, the work is silently dropped - no retry, no error, no log
-  anywhere pointing at it. Anything that must survive a crash mid-processing
-  has to be built on top of these two patterns (the handler durably
-  recording its own progress/results before returning, an application-level
-  dead-letter queue, external monitoring, etc.) - it does not come for free.
+1. **Routing and broker confirmation.** `AMQPTransport` uses publisher
+   confirms and mandatory publishing (through aio-pika's channel and publish
+   defaults, with `on_return_raises=True`). If a message has no bound queue,
+   RabbitMQ returns it as unroutable. For RPC, this becomes
+   `NoRouteError`. For task-queue and broadcast publishing, the transport
+   catches that publish error, logs it, and returns normally - so those
+   methods currently do not report an unroutable message to their caller.
+   When a publish is routed, a successful publish await confirms broker
+   acceptance; it does **not** confirm consumer receipt or processing. If
+   the connection fails before the outcome is known, the broker may already
+   have accepted the message, so retrying can publish a duplicate.
+2. **Queue retention.** `@atask_queue` messages are persistent and its named
+   queue is durable, but the queue is first declared by consumer registration.
+   A publish before that first declaration has no route and is dropped. Once
+   the queue exists, routed persistent messages can be retained by the broker
+   while consumers are offline. RPC requests are not marked persistent, and
+   broadcast queues are exclusive, auto-delete queues; neither gets the same
+   broker-restart retention guarantee. A persistent message alone does not
+   make a transient queue durable.
+3. **Handler processing.** In all three patterns the consumer acknowledges a
+   message as soon as it receives it, before calling the registered handler.
+   This is intentional: a transport's RPC consumer shares one AMQP prefetch
+   slot across the task names it serves, and deferring the ack until a handler
+   finishes can deadlock nested/self-referential calls. Once RabbitMQ has
+   processed that ack, a handler crash does not cause redelivery. An exception
+   from a task-queue or broadcast handler is logged, but the message has
+   already been acknowledged and is not retried. For RPC, the caller instead
+   waits for a reply and eventually gets `RequestTimeoutError` (or
+   `ConnectionLostError` if its connection drops); a timeout does not cancel
+   work that may still be queued or running.
 
-**This package deliberately does not attempt to solve either problem for
-you.** For RPC, de-duplication (idempotency keys, "processed event" tables,
+Therefore there is **no end-to-end exactly-once guarantee**. A single
+successful broker-routed publish can still lead to zero completed handlers,
+for example if the consumer fails after acknowledging. Retrying after an
+ambiguous publish or RPC failure can make the same logical work run more than
+once. Mandatory publishing only reports messages that could not be routed; it
+does not change either outcome.
+
+For RPC, de-duplication (idempotency keys, "processed event" tables,
 `INSERT ... ON CONFLICT DO NOTHING`-style upserts, etc.) is the
 caller's/handler's responsibility whenever a caller-side retry is in play -
 every function registered with `@atask` should be safe to run more than once
-for the same logical input. For `@atask_queue`/`@atask_broadcast`, surviving
-a crash mid-processing is the handler's own responsibility to design for, if
-the use case needs it at all - the delivery mechanism itself won't help.
+for the same logical input. For `@atask_queue` and `@atask_broadcast`, any
+recovery from a crash during processing (durably recording progress/results,
+an application-level dead-letter queue, external monitoring, etc.) must be
+designed by the application; the delivery mechanism does not provide it.
 
 ## Commands
 
