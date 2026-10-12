@@ -676,6 +676,21 @@ Other options, independent of any namespace:
 - `-v`, `--verbosity` - logging verbosity from `0` to `4` (default `1`).
 - `-L`, `--loggers` - logger names to configure; defaults to `atasks`.
 - `-o`, `--option` - additional values made available to `aiomain` as `opt`.
+- `--health-http=HOST[:PORT][/PATH]` - start an HTTP liveness endpoint on the
+    main asyncio loop. The default port is `80` and the default path is `/`.
+    Install it with `pip install 'atasks[aiohttp]'`. This reports only whether
+    the loop can execute requests; it is not a dependency readiness check. For
+    Kubernetes, configure this endpoint as an HTTP `livenessProbe`.
+- `--self-watchdog` - run a thread which periodically probes the main asyncio
+    loop. `--self-watchdog-period`, `--self-watchdog-timeout`, and
+    `--self-watchdog-kill-after` configure the probe period (default `10`),
+    timeout (default `30`), and SIGKILL fallback delay (default `5`) in seconds.
+    On timeout the process receives SIGABRT, then SIGKILL if it survives.
+- `--systemd-watchdog` - send main-loop heartbeats through systemd's watchdog
+    protocol. Install it with `pip install 'atasks[systemd-watchdog]'` and run
+    under a unit configured with `Type=notify`, `WatchdogSec=`, and
+    `Restart=on-watchdog`. The command fails if the systemd watchdog environment
+    is not configured.
 
 Run the module with `--help` to see the complete command-line reference:
 
