@@ -7,7 +7,7 @@ from codecs import open
 from os import path
 
 # Always prefer setuptools over distutils
-from setuptools import find_packages, setup
+from setuptools import setup
 
 
 here = path.abspath(path.dirname(__file__))
@@ -25,6 +25,7 @@ setup(
     use_scm_version=True,
     packages=[
         'atasks',
+        'atasks.commands',
         'atasks.transport',
         'atasks.transport.backends',
     ],
@@ -36,7 +37,14 @@ setup(
         ],
     },
     extras_require={
+        'aiohttp': [
+            'aiohttp',
+        ],
+        'systemd-watchdog': [
+            'systemd-watchdog',
+        ],
         'test': [
+            'aiohttp',
             'flake8',
             'wrapt',
             'tox',
@@ -44,6 +52,7 @@ setup(
             'pydocstyle',
             'backoff',
             'coverage',
+            'systemd-watchdog',
         ],
     },
     setup_requires=['setuptools-scm>=8'],

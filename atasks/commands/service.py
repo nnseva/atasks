@@ -6,9 +6,12 @@ import asyncio
 import importlib
 import logging
 import logging.config
+import math
 import os
 import signal
 import sys
+import threading
+import time
 
 
 if __name__ == '__main__':
@@ -23,6 +26,163 @@ _NAMESPACE_SPEC_KEYS = frozenset((
     'name', 'mode', 'transport', 'url', 'hostname',
     'max-trace-depth', 'trace-filter-modules', 'collect-await-frames',
 ))
+
+
+def _parse_health_http(value):
+    """Parse a ``HOST[:PORT][/PATH]`` health endpoint binding."""
+    value = value.strip()
+    if not value or '?' in value or '#' in value or '@' in value:
+        raise argparse.ArgumentTypeError('health HTTP address must be HOST[:PORT][/PATH]')
+
+    address, separator, path_suffix = value.partition('/')
+    path = '/' + path_suffix if separator else '/'
+    if not address:
+        raise argparse.ArgumentTypeError('health HTTP address must include a host')
+
+    if address.startswith('['):
+        closing = address.find(']')
+        if closing == -1:
+            raise argparse.ArgumentTypeError('IPv6 health HTTP host must end with ]')
+        host = address[1:closing]
+        remainder = address[closing + 1:]
+        if not remainder:
+            port_value = '80'
+        elif remainder.startswith(':'):
+            port_value = remainder[1:]
+        else:
+            raise argparse.ArgumentTypeError('invalid IPv6 health HTTP address')
+    elif address.count(':') <= 1:
+        if ':' in address:
+            host, port_value = address.rsplit(':', 1)
+        else:
+            host, port_value = address, '80'
+    else:
+        raise argparse.ArgumentTypeError('IPv6 health HTTP host must be enclosed in []')
+
+    if not host:
+        raise argparse.ArgumentTypeError('health HTTP address must include a host')
+    try:
+        port = int(port_value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('health HTTP port must be an integer')
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError('health HTTP port must be between 1 and 65535')
+    return host, port, path
+
+
+def _positive_seconds(value):
+    """Parse a finite, strictly positive duration in seconds."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('duration must be a number of seconds')
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError('duration must be a finite positive number of seconds')
+    return seconds
+
+
+async def _start_health_http(address):
+    """Start the optional aiohttp loop-liveness endpoint."""
+    try:
+        from aiohttp import web  # type: ignore[import-not-found]
+    except ImportError as ex:
+        raise RuntimeError('HTTP liveness requires the aiohttp extra: pip install atasks[aiohttp]') from ex
+
+    host, port, path = address
+
+    async def health_handler(request):
+        logger.debug('Received health check request at %s', path)
+        return web.Response(text='OK\n')
+
+    application = web.Application()
+    application.router.add_get(path, health_handler)
+    runner = web.AppRunner(application)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, host=host, port=port)
+        await site.start()
+    except Exception:
+        await runner.cleanup()
+        raise
+    logger.info('Serving asyncio loop liveness endpoint at http://%s:%s%s', host, port, path)
+    return runner
+
+
+class _SelfWatchdog(object):
+    """Probe the main event loop from a thread and abort if it stops responding."""
+    def __init__(self, loop, period, timeout, kill_after):
+        self.loop = loop
+        self.period = period
+        self.timeout = timeout
+        self.kill_after = kill_after
+        self._stop = threading.Event()
+        self._acknowledgement = None
+        self._thread = threading.Thread(target=self._run, name='atasks-self-watchdog', daemon=True)
+
+    def start(self):
+        """Start monitoring the configured event loop."""
+        self._thread.start()
+
+    def stop(self):
+        """Stop monitoring and wait briefly for the worker thread to leave."""
+        self._stop.set()
+        if self._acknowledgement is not None:
+            self._acknowledgement.set()
+        logger.info('Stopping self-watchdog thread (<=%ss)', self.period + self.timeout + 1)
+        self._thread.join(timeout=self.period + self.timeout + 1)
+
+    def _run(self):
+        while not self._stop.wait(self.period):
+            acknowledgement = threading.Event()
+            self._acknowledgement = acknowledgement
+            try:
+                self.loop.call_soon_threadsafe(acknowledgement.set)
+            except RuntimeError:
+                if self._stop.is_set():
+                    return
+                self._abort()
+                return
+
+            logger.debug('Waiting up to %s seconds for main asyncio loop acknowledgement', self.timeout)
+            acknowledged = acknowledgement.wait(self.timeout)
+            if acknowledged and not self._stop.is_set():
+                logger.debug('Main asyncio loop acknowledged self-watchdog probe')
+            if acknowledged or self._stop.is_set():
+                continue
+            self._abort()
+            return
+
+    def _abort(self):
+        logger.critical('The main asyncio event loop did not respond within %s seconds; aborting', self.timeout)
+        os.kill(os.getpid(), signal.SIGABRT)
+        time.sleep(self.kill_after)
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _start_systemd_watchdog():
+    """Create the optional systemd watchdog client and validate its environment."""
+    try:
+        import systemd_watchdog  # type: ignore[import-not-found]
+    except ImportError as ex:
+        raise RuntimeError(
+            'systemd watchdog support requires the systemd-watchdog extra: '
+            'pip install atasks[systemd-watchdog]'
+        ) from ex
+
+    watchdog = systemd_watchdog.WatchDog()
+    if not watchdog.is_enabled:
+        raise RuntimeError('--systemd-watchdog requires a configured systemd watchdog environment')
+    return watchdog
+
+
+async def _systemd_watchdog_loop(watchdog):
+    """Send systemd watchdog heartbeats from the main asyncio event loop."""
+    interval = watchdog.timeout / (2 * 10**6)  # Convert microseconds to seconds and divide by 2 for safety margin
+    watchdog.ready()
+    watchdog.ping()
+    while True:
+        await asyncio.sleep(interval)
+        watchdog.ping()
 
 
 def _parse_namespace_spec(spec):
@@ -183,7 +343,23 @@ async def aiomain(**options):
         if ns['mode'] in ('server', 'loopback'):
             server_namespaces.append(name)
 
+    health_runner = None
+    self_watchdog = None
+    systemd_watchdog_task = None
+    health_address = options.get('health_http')
     try:
+        if health_address is not None:
+            health_runner = await _start_health_http(health_address)
+
+        if options.get('self_watchdog'):
+            self_watchdog = _SelfWatchdog(
+                asyncio.get_running_loop(),
+                options.get('self_watchdog_period', 10),
+                options.get('self_watchdog_timeout', 30),
+                options.get('self_watchdog_kill_after', 5),
+            )
+            self_watchdog.start()
+
         routers = {name: get_router(namespace=name) for name in transports}
         futures = []
         for filename in options['scenario']:
@@ -202,11 +378,17 @@ async def aiomain(**options):
         for name in server_namespaces:
             await routers[name].activate(transports[name])
         try:
+            if options.get('systemd_watchdog'):
+                systemd_watchdog_task = asyncio.create_task(_systemd_watchdog_loop(_start_systemd_watchdog()))
+
             if futures:
                 logger.info("Running scenario modules")
                 await asyncio.gather(*futures)
 
-            if any(ns['mode'] == 'server' for ns in options['namespaces']):
+            should_listen = any(ns['mode'] == 'server' for ns in options['namespaces'])
+            should_listen = should_listen or health_address is not None
+            should_listen = should_listen or options.get('self_watchdog') or options.get('systemd_watchdog')
+            if should_listen:
                 for s in set([
                     signal.SIGINT,
                     signal.SIGQUIT,
@@ -220,9 +402,19 @@ async def aiomain(**options):
 
                 logger.info("Execution stopped")
         finally:
+            if systemd_watchdog_task is not None:
+                systemd_watchdog_task.cancel()
+                try:
+                    await systemd_watchdog_task
+                except asyncio.CancelledError:
+                    pass
             for name in server_namespaces:
                 await routers[name].deactivate()
     finally:
+        if self_watchdog is not None:
+            self_watchdog.stop()
+        if health_runner is not None:
+            await health_runner.cleanup()
         await _disconnect_connected_transports(options['namespaces'])
 
 
@@ -255,6 +447,40 @@ def main(argv=None):
         nargs='*',
         dest='opt',
         help='Additional options available to analize in the module aiomain function/future',
+    )
+    parser.add_argument(
+        '--health-http',
+        metavar='HOST[:PORT][/PATH]',
+        type=_parse_health_http,
+        help='Serve an asyncio-loop liveness endpoint; default port/path are 80 and /',
+    )
+    parser.add_argument(
+        '--self-watchdog',
+        action='store_true',
+        help='Terminate this process when its main asyncio loop stops responding',
+    )
+    parser.add_argument(
+        '--self-watchdog-period',
+        type=_positive_seconds,
+        default=10,
+        help='Seconds between self-watchdog probes; default: %(default)s',
+    )
+    parser.add_argument(
+        '--self-watchdog-timeout',
+        type=_positive_seconds,
+        default=30,
+        help='Seconds a self-watchdog probe may wait; default: %(default)s',
+    )
+    parser.add_argument(
+        '--self-watchdog-kill-after',
+        type=_positive_seconds,
+        default=5,
+        help='Seconds after SIGABRT before the self-watchdog sends SIGKILL; default: %(default)s',
+    )
+    parser.add_argument(
+        '--systemd-watchdog',
+        action='store_true',
+        help='Send watchdog heartbeats through the optional systemd-watchdog package',
     )
 
     parser.add_argument(
@@ -316,6 +542,15 @@ for the full reference and examples.
 
     args = parser.parse_args(argv[1:])
     options = vars(args)
+
+    if not options['self_watchdog']:
+        watchdog_options = (
+            '--self-watchdog-period',
+            '--self-watchdog-timeout',
+            '--self-watchdog-kill-after',
+        )
+        if any(arg == option or arg.startswith(option + '=') for arg in argv[1:] for option in watchdog_options):
+            parser.error('self-watchdog timing options require --self-watchdog')
 
     # No -N/--namespace at all: fall back to a single default-configured
     # 'default' namespace (client mode, loopback transport) - the same
