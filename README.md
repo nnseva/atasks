@@ -265,10 +265,23 @@ class MyTransport(Transport):
 
 ```
 
-The four `_register_*_callback`/`_unregister_*_callback` pairs are protected -
+The three `_register_*_callback`/`_unregister_*_callback` pairs are protected -
 `Router.activate()`/`deactivate()` are their only caller, once per name known
 to the router at the moment `activate()` runs (see [Client and
 Server](#client-and-server) below). Library users never call them directly.
+
+The `_register_*_callback` callbacks follow a shared contract, which is what
+makes graceful drain work:
+
+* A callback is a plain synchronous function (not `async def`). It returns an
+  `asyncio.Task` that processes the message, or `None` to refuse it.
+* The task is owned by the router. The transport must not await or cancel it
+  on its own behalf.
+* Request callbacks are called as `callback(content, reply)`. The router awaits
+  `reply(response_bytes)` inside its task to publish the response. Event and
+  broadcast callbacks are called as `callback(content)`.
+* A refused message (`None`) is returned to the backend for redelivery where
+  the backend supports it (AMQP: `reject(requeue=True)`).
 
 ### Client and Server
 
@@ -691,6 +704,23 @@ Other options, independent of any namespace:
     under a unit configured with `Type=notify`, `WatchdogSec=`, and
     `Restart=on-watchdog`. The command fails if the systemd watchdog environment
     is not configured.
+- `--shutdown-timeout` - graceful drain on SIGTERM/SIGINT (default `20`
+    seconds). The service stops accepting new requests, events and broadcasts
+    (they are refused and returned to the queue), then waits up to this timeout
+    for in-flight handlers to finish and send their replies. Handlers still
+    running after the timeout are cancelled (a warning is logged for each one),
+    and their callers receive `ServiceShuttingDown`. Keep this value below the
+    orchestrator's grace period (Docker defaults to 10 seconds, Kubernetes to 30
+    seconds). A second signal during shutdown forces an immediate exit.
+- `--fail-on-shutdown-timeout` - treat a shutdown that hit the timeout as a
+    failure: the error is logged and the process exits with code `1`. By default
+    a timed-out drain exits with code `0`, so the service is not restarted
+    needlessly.
+
+Limitation: a service that calls itself during shutdown. With a single running
+instance, such a nested call blocks until the drain timeout, so the call fails
+with `ServiceShuttingDown`. With several instances, the other instances serve
+it.
 
 Run the module with `--help` to see the complete command-line reference:
 

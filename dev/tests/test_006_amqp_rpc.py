@@ -21,7 +21,7 @@ import backoff
 
 from atasks.codecs import PickleCodec
 from atasks.namespaces import namespaces
-from atasks.router import get_router
+from atasks.router import ResultNotSerializable, get_router
 from atasks.tasks import atask
 from atasks.transport.backends.amqp import AMQPTransport
 from atasks.transport.base import (
@@ -111,6 +111,21 @@ class AMQPRPCTest(TestCase):
 
         with self.assertRaises(ValueError):
             await boom()
+
+    async def test_002b_unserializable_result_raises_on_caller(self):
+        """A result that cannot be pickled is replaced by ResultNotSerializable,
+        so the caller gets an answer over the real broker instead of a timeout."""
+        namespace = self.namespace
+
+        @atask(namespace=namespace, timeout=5)
+        async def unserializable_result():
+            return lambda: None  # lambdas cannot be pickled
+
+        router = get_router(namespace)
+        await router.activate(self.server_transport)
+
+        with self.assertRaises(ResultNotSerializable):
+            await unserializable_result()
 
     async def test_003_no_route_when_no_worker(self):
         """An unregistered task has no bound queue and fails immediately."""

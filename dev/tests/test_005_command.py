@@ -12,7 +12,7 @@ from unittest.mock import patch
 import atasks.cli as cli_module
 import atasks.commands.service as run_module
 from atasks.commands.service import aiomain, main
-from atasks.transport.base import LoopbackTransport
+from atasks.transport.base import LoopbackTransport, get_transport
 
 
 def _ns(name, **overrides):
@@ -304,6 +304,38 @@ async def invalidate_cache():
         registered = [c[len('register:'):] for c in calls if c.startswith('register:')]
         unregistered = [c[len('unregister:'):] for c in calls if c.startswith('unregister:')]
         self.assertEqual(sorted(registered), sorted(unregistered))
+
+    async def test_run_connect_failure_disconnects_only_connected_transports(self):
+        """When one namespace fails to connect, ``aiomain()`` stops before creating
+        the transports of the namespaces after it. Only the transports that actually
+        connected may be disconnected: the failed one is skipped by ``is_connected()``
+        and the not-yet-created one is skipped because ``get_transport()`` returns None.
+        """
+        disconnected = []
+
+        class ScriptedTransport(LoopbackTransport):
+            def __init__(self, url=None, **kwargs):
+                super().__init__(**kwargs)
+
+            async def connect(self):
+                if self.namespace == 'drain-broken':
+                    raise ConnectionError('broker is down')
+                await super().connect()
+
+            async def disconnect(self):
+                disconnected.append(self.namespace)
+                await super().disconnect()
+
+        namespaces = [
+            _ns('drain-first', transport='amqp'),
+            _ns('drain-broken', transport='amqp'),
+            _ns('drain-never', transport='amqp'),
+        ]
+        with patch('atasks.transport.backends.amqp.AMQPTransport', ScriptedTransport), self.assertLogs('atasks.commands.service', level='ERROR'):
+            result = await aiomain(namespaces=namespaces, scenario=[], opt=None)
+        self.assertFalse(result)
+        self.assertEqual(disconnected, ['drain-first'])
+        self.assertIsNone(get_transport('drain-never'))
 
     async def test_run_activate_registers_and_deactivate_unregisters_every_atask(self):
         """With a real scenario module loaded, ``activate()``/``deactivate()``

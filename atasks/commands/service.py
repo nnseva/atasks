@@ -21,6 +21,8 @@ else:
 
 exit_run = False
 
+DEFAULT_SHUTDOWN_TIMEOUT = 20
+
 # Keys accepted inside one -N/--namespace SPEC (see _parse_namespace_spec).
 _NAMESPACE_SPEC_KEYS = frozenset((
     'name', 'mode', 'transport', 'url', 'hostname',
@@ -300,6 +302,26 @@ async def _disconnect_connected_transports(namespace_specs):
             await transport.disconnect()
 
 
+async def _drain_routers(routers, namespaces, timeout):
+    """
+    Stop accepting new work, wait for accepted handler tasks, cancel the rest.
+
+    :param routers: mapping of namespace name to its Router
+    :param namespaces: names of the server namespaces to drain
+    :param timeout: seconds to let accepted tasks finish before cancelling them
+    :returns: ``True`` if the drain had to end by timeout (some tasks were cancelled)
+    :rtype: bool
+    """
+    for name in namespaces:
+        await routers[name].deactivate()
+    finished = await asyncio.gather(*(routers[name].wait_idle(timeout) for name in namespaces))
+    if all(finished):
+        return False
+    for name in namespaces:
+        await routers[name].cancel_active()
+    return True
+
+
 async def aiomain(**options):
     """The non-task main function calls tasks from atasks worker, not self process"""
     from atasks.codecs import PickleCodec
@@ -343,6 +365,7 @@ async def aiomain(**options):
         if ns['mode'] in ('server', 'loopback'):
             server_namespaces.append(name)
 
+    exit_code = 0
     health_runner = None
     self_watchdog = None
     systemd_watchdog_task = None
@@ -402,26 +425,38 @@ async def aiomain(**options):
 
                 logger.info("Execution stopped")
         finally:
+            if server_namespaces:
+                timed_out = await _drain_routers(routers, server_namespaces, options.get('shutdown_timeout', DEFAULT_SHUTDOWN_TIMEOUT))
+                if timed_out:
+                    if options.get('fail_on_shutdown_timeout', False):
+                        logger.error('Shutdown timeout expired, cancelled unfinished tasks')
+                        exit_code = 1
+                    else:
+                        logger.info('Shutdown timeout expired, cancelled unfinished tasks')
             if systemd_watchdog_task is not None:
                 systemd_watchdog_task.cancel()
                 try:
                     await systemd_watchdog_task
                 except asyncio.CancelledError:
                     pass
-            for name in server_namespaces:
-                await routers[name].deactivate()
     finally:
         if self_watchdog is not None:
             self_watchdog.stop()
         if health_runner is not None:
             await health_runner.cleanup()
         await _disconnect_connected_transports(options['namespaces'])
+    return exit_code
 
 
 def sig_handler(sig_num, stack_frame):
-    """Signal handler"""
+    """Signal handler; a repeated signal during shutdown forces the process to exit"""
     global exit_run
     signal_names = dict((s.value, s.name) for s in signal.Signals)
+    if exit_run:
+        logger.warning("Signal %s[%s] received during shutdown, forcing exit", signal_names.get(sig_num, 'UNKNOWN'), sig_num)
+        signal.signal(sig_num, signal.SIG_DFL)
+        os.kill(os.getpid(), sig_num)
+        return
     logger.info("Signal %s[%s] cought, exiting...", signal_names.get(sig_num, 'UNKNOWN'), sig_num)
     exit_run = True
 
@@ -476,6 +511,18 @@ def main(argv=None):
         type=_positive_seconds,
         default=5,
         help='Seconds after SIGABRT before the self-watchdog sends SIGKILL; default: %(default)s',
+    )
+    parser.add_argument(
+        '--shutdown-timeout',
+        type=_positive_seconds,
+        default=DEFAULT_SHUTDOWN_TIMEOUT,
+        help=('Seconds a server namespace waits for in-flight calls to finish after a signal, '
+              'before cancelling them; keep it below the orchestrator grace period; default: %(default)s'),
+    )
+    parser.add_argument(
+        '--fail-on-shutdown-timeout',
+        action='store_true',
+        help='Exit with a non-zero code and log an error when the shutdown timeout cancels unfinished tasks',
     )
     parser.add_argument(
         '--systemd-watchdog',
@@ -601,7 +648,7 @@ for the full reference and examples.
 
     loop = asyncio.new_event_loop()
     try:
-        loop.run_until_complete(aiomain(**options))
+        exit_code = loop.run_until_complete(aiomain(**options))
     finally:
         # A loop left open here is only closed implicitly, whenever the
         # garbage collector gets around to it - by which point interpreter
@@ -610,6 +657,8 @@ for the full reference and examples.
         # "no running event loop" errors instead of a clean cancellation.
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == '__main__':
