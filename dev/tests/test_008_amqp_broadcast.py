@@ -102,8 +102,12 @@ class AMQPBroadcastTest(TestCase):
             received.append(bucket)
 
             def _make_handler(bucket):
-                async def _handle(content):
+                async def _handle_impl(content):
                     bucket.append(content.decode())
+
+                def _handle(content):
+                    return asyncio.create_task(_handle_impl(content))
+
                 return _handle
 
             await transport._register_broadcast_callback(name, _make_handler(bucket))
@@ -146,8 +150,11 @@ class AMQPBroadcastTest(TestCase):
         transport = await self._new_transport()
         received = []
 
-        async def _handle(content):
+        async def __handle_impl(content):
             received.append(content.decode())
+
+        def _handle(content):
+            return asyncio.create_task(__handle_impl(content))
 
         await transport._register_broadcast_callback(name, _handle)
         await asyncio.sleep(0.3)

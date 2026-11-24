@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 import uuid
 
 import aio_pika
@@ -9,6 +10,7 @@ from atasks.transport.base import (
     NoRouteError,
     RequestTimeoutError,
     Transport,
+    watch_handler_task,
 )
 
 
@@ -264,13 +266,9 @@ class AMQPTransport(Transport):
         heartbeat-timeout test) surfaces a raw CancelledError instead of the
         documented ConnectionLostError - the same as before this was fixed.
         """
-        task = asyncio.current_task()
-        if task is None:
-            return False
-        cancelling = getattr(task, 'cancelling', None)
-        if cancelling is None:
+        if sys.version_info < (3, 11):  # pragma: no cover - Python 3.10 only, see docstring
             return True
-        return bool(cancelling())
+        return asyncio.current_task().cancelling() > 0
 
     async def _on_connection_closed(self, connection, exc=None):
         """
@@ -303,34 +301,40 @@ class AMQPTransport(Transport):
             await queue.bind(self._request_exchange, self._request_routing_prefix + name)
 
             async def _on_message(message):
-                async with message.process():
+                async with message.process(ignore_processed=True):
                     info = message.info()
-                    request = message.body
-                correlation_id = info['correlation_id']
-                logger.info('Got request for %s[%s]', name, correlation_id)
-                try:
-                    response = await callback(request)
-                except Exception:
-                    # TODO: should the exception here be propagated back to the caller?
-                    logger.exception('Unhandled error handling request for %s[%s]', name, correlation_id)
-                    return
+                    correlation_id = info['correlation_id']
+                    logger.info('Got request for %s[%s]', name, correlation_id)
 
-                logger.info('Publishing result for %s[%s]', name, correlation_id)
-                try:
-                    await self._response_exchange.publish(
-                        aio_pika.Message(
-                            correlation_id=correlation_id,
-                            body=response
-                        ),
-                        routing_key=info['reply_to'],
-                    )
-                except Exception as exc:
-                    # TODO: should the failure to publish the response be propagated?
-                    logger.exception('Failed to publish response for %s[%s]', name, correlation_id)
-                    # If this transport instance is also used to make outbound
-                    # requests (client and server sharing one instance) and the
-                    # connection just died, don't leave those hanging either.
-                    self._fail_awaiting_requests(exc)
+                    async def reply(response):
+                        logger.info('Publishing result for %s[%s]', name, correlation_id)
+                        try:
+                            await self._response_exchange.publish(
+                                aio_pika.Message(
+                                    correlation_id=correlation_id,
+                                    body=response
+                                ),
+                                routing_key=info['reply_to'],
+                            )
+                        except Exception as exc:
+                            # TODO: should the failure to publish the response be propagated?
+                            logger.exception('Failed to publish response for %s[%s]', name, correlation_id)
+                            # If this transport instance is also used to make outbound
+                            # requests (client and server sharing one instance) and the
+                            # connection just died, don't leave those hanging either.
+                            self._fail_awaiting_requests(exc)
+
+                    try:
+                        task = callback(message.body, reply)
+                    except Exception:
+                        # TODO: should the exception here be propagated back to the caller?
+                        logger.exception('Unhandled error handling request for %s[%s]', name, correlation_id)
+                        return
+                    if task is not None:
+                        watch_handler_task(task, f'request for {name}[{correlation_id}]')
+                    else:
+                        # Service is shutting down: give the message back for another instance.
+                        await message.reject(requeue=True)
 
             consumer_tag = await queue.consume(_on_message)
             self._request_queues[name] = queue
@@ -458,12 +462,16 @@ class AMQPTransport(Transport):
             await queue.bind(self._event_exchange, self._event_routing_prefix + name)
 
             async def _on_event_message(message):
-                async with message.process():
-                    content = message.body
-                try:
-                    await callback(content)
-                except Exception:
-                    logger.exception('Unhandled error handling queue event %s', name)
+                async with message.process(ignore_processed=True):
+                    try:
+                        task = callback(message.body)
+                    except Exception:
+                        logger.exception('Unhandled error handling queue event %s', name)
+                        return
+                    if task is not None:
+                        watch_handler_task(task, f'queue event {name}')
+                    else:
+                        await message.reject(requeue=True)
 
             consumer_tag = await queue.consume(_on_event_message)
             self._event_queues[name] = queue
@@ -525,12 +533,16 @@ class AMQPTransport(Transport):
             await queue.bind(self._broadcast_exchange, self._broadcast_routing_prefix + name)
 
             async def _on_broadcast_message(message):
-                async with message.process():
-                    content = message.body
-                try:
-                    await callback(content)
-                except Exception:
-                    logger.exception('Unhandled error handling broadcast event %s', name)
+                async with message.process(ignore_processed=True):
+                    try:
+                        task = callback(message.body)
+                    except Exception:
+                        logger.exception('Unhandled error handling broadcast event %s', name)
+                        return
+                    if task is not None:
+                        watch_handler_task(task, f'broadcast event {name}')
+                    else:
+                        await message.reject(requeue=True)
 
             consumer_tag = await queue.consume(_on_broadcast_message)
             self._broadcast_queues[name] = queue

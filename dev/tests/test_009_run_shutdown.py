@@ -16,8 +16,13 @@ scenarios. See the reported repro (pre-multi-namespace CLI):
 ``RunAMQPShutdownTest`` runs the real command as a subprocess (exactly like
 the repro) against a real broker and asserts none of that noise appears, for
 a 'client' namespace (no activation at all) and for a 'server' one (activated,
-then shut down via a real OS signal - the only way to end a 'server'
-namespace's "Listening for requests" wait, see atasks/service.py's aiomain()).
+then shut down via a real OS signal). It also verifies a request already being
+handled finishes and its response reaches the caller before shutdown completes.
+
+``RunAMQPShutdownTimeoutTest`` covers the drain timeout: a handler that never
+returns is cancelled once ``--shutdown-timeout`` expires, the caller receives
+``ServiceShuttingDown``, and the exit code is 0 by default or 1 with
+``--fail-on-shutdown-timeout``.
 
 ``RunMultiNamespaceListeningTest`` covers the core multi-namespace rule
 itself - the process must enter "Listening for requests" as soon as *any*
@@ -29,13 +34,20 @@ ATASKS_TEST_AMQP_URL (default amqp://guest:guest@localhost/) for
 ``RunAMQPShutdownTest`` only. Those tests are skipped (not failed) if no
 broker is reachable.
 """
+import asyncio
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from unittest import IsolatedAsyncioTestCase as TestCase
 
+from atasks.codecs import PickleCodec
+from atasks.router import ServiceShuttingDown
+from atasks.tasks import atask
+from atasks.transport.backends.amqp import AMQPTransport
 from dev.tests._amqp_environment import require_amqp
 
 
@@ -112,7 +124,7 @@ def _run_server_until_signaled(*namespace_specs, extra_args=(), timeout=15):
 
 
 class RunAMQPShutdownTest(TestCase):
-    """``python -m atasks.commands.service ... transport=amqp`` must exit cleanly, with no leftover tasks."""
+    """AMQP-backed service shutdown must exit cleanly without abandoning work."""
 
     async def asyncSetUp(self):
         """Require AMQP unless this integration group was explicitly disabled."""
@@ -139,6 +151,247 @@ class RunAMQPShutdownTest(TestCase):
         self.assertEqual(returncode, 0, msg=stderr)
         for pattern in BAD_PATTERNS:
             self.assertNotIn(pattern, stderr, pattern)
+
+    async def test_003_sigterm_waits_for_in_flight_rpc_to_reply(self):
+        """SIGTERM during an RPC must not close the transport before its handler
+        completes and publishes the response."""
+        namespace = 'test-shutdown-%s' % uuid.uuid4().hex
+
+        with tempfile.TemporaryDirectory() as directory:
+            started_path = os.path.join(directory, 'started')
+            release_path = os.path.join(directory, 'release')
+            completed_path = os.path.join(directory, 'completed')
+            scenario_path = os.path.join(directory, 'scenario.py')
+            with open(scenario_path, 'w', encoding='utf-8') as scenario_file:
+                scenario_file.write(
+                    'import asyncio\n'
+                    'import os\n'
+                    'from atasks.tasks import atask\n'
+                    '\n'
+                    '@atask(namespace=%r, name="shutdown_probe")\n'
+                    'async def shutdown_probe():\n'
+                    '    open(os.environ["ATASKS_TEST_STARTED"], "w").close()\n'
+                    '    while not os.path.exists(os.environ["ATASKS_TEST_RELEASE"]):\n'
+                    '        await asyncio.sleep(0.02)\n'
+                    '    open(os.environ["ATASKS_TEST_COMPLETED"], "w").close()\n'
+                    '    return "completed"\n'
+                    % namespace
+                )
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, '-m', 'atasks.commands.service',
+                '-v', '4',
+                '-N', 'name=%s,mode=server,transport=amqp,url=%s' % (namespace, AMQP_URL),
+                scenario_path,
+                cwd=REPO_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(
+                    os.environ,
+                    PYTHONUNBUFFERED='1',
+                    ATASKS_TEST_STARTED=started_path,
+                    ATASKS_TEST_RELEASE=release_path,
+                    ATASKS_TEST_COMPLETED=completed_path,
+                ),
+            )
+
+            stderr_lines = []
+            ready = asyncio.Event()
+            signal_received = asyncio.Event()
+            shutdown_started = asyncio.Event()
+
+            async def read_stderr():
+                async for raw_line in proc.stderr:
+                    line = raw_line.decode(errors='replace')
+                    stderr_lines.append(line)
+                    if READY_PATTERN in line:
+                        ready.set()
+                    if 'Signal SIGTERM' in line:
+                        signal_received.set()
+                    if 'Execution stopped' in line:
+                        shutdown_started.set()
+
+            stderr_reader = asyncio.create_task(read_stderr())
+            client_transport = None
+            call_task = None
+            signal_sent = False
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=15)
+
+                PickleCodec(namespace=namespace)
+                client_transport = AMQPTransport(namespace=namespace, url=AMQP_URL)
+                await client_transport.connect()
+
+                @atask(namespace=namespace, name='shutdown_probe', timeout=20)
+                async def shutdown_probe():
+                    raise AssertionError('The client-side RPC stub must not run locally')
+
+                call_task = asyncio.create_task(shutdown_probe())
+                await asyncio.wait_for(
+                    self._wait_for_file(started_path),
+                    timeout=10,
+                )
+
+                proc.send_signal(signal.SIGTERM)
+                signal_sent = True
+                await asyncio.wait_for(signal_received.wait(), timeout=5)
+                await asyncio.wait_for(shutdown_started.wait(), timeout=5)
+
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    self.fail(
+                        'service exited while the RPC handler was held at its barrier:\n%s'
+                        % ''.join(stderr_lines)
+                    )
+
+                with open(release_path, 'w', encoding='utf-8'):
+                    pass
+
+                result = await asyncio.wait_for(call_task, timeout=10)
+                self.assertEqual(result, 'completed')
+                await asyncio.wait_for(proc.wait(), timeout=10)
+                await asyncio.wait_for(stderr_reader, timeout=5)
+
+                self.assertEqual(proc.returncode, 0, msg=''.join(stderr_lines))
+                self.assertTrue(os.path.exists(completed_path))
+                for pattern in BAD_PATTERNS:
+                    self.assertNotIn(pattern, ''.join(stderr_lines), pattern)
+            finally:
+                with open(release_path, 'w', encoding='utf-8'):
+                    pass
+                if call_task is not None and not call_task.done():
+                    call_task.cancel()
+                    try:
+                        await call_task
+                    except asyncio.CancelledError:
+                        pass
+                if proc.returncode is None:
+                    if not signal_sent:
+                        proc.send_signal(signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                if client_transport is not None:
+                    await client_transport.disconnect()
+                if not stderr_reader.done():
+                    await asyncio.wait_for(stderr_reader, timeout=5)
+
+    @staticmethod
+    async def _wait_for_file(path):
+        while not os.path.exists(path):
+            await asyncio.sleep(0.02)
+
+
+class RunAMQPShutdownTimeoutTest(TestCase):
+    """
+    SIGTERM while a handler never finishes: after ``--shutdown-timeout`` the
+    handler is cancelled, the caller receives ``ServiceShuttingDown`` and the
+    process exits (0 by default, non-zero with ``--fail-on-shutdown-timeout``).
+    """
+
+    async def _run_stuck_handler(self, extra_args):
+        namespace = 'test-shutdown-timeout-%s' % uuid.uuid4().hex
+
+        with tempfile.TemporaryDirectory() as directory:
+            started_path = os.path.join(directory, 'started')
+            scenario_path = os.path.join(directory, 'scenario.py')
+            with open(scenario_path, 'w', encoding='utf-8') as scenario_file:
+                scenario_file.write(
+                    'import asyncio\n'
+                    'import os\n'
+                    'from atasks.tasks import atask\n'
+                    '\n'
+                    '@atask(namespace=%r, name="stuck_probe")\n'
+                    'async def stuck_probe():\n'
+                    '    open(os.environ["ATASKS_TEST_STARTED"], "w").close()\n'
+                    '    while True:\n'
+                    '        await asyncio.sleep(0.02)\n'
+                    % namespace
+                )
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, '-m', 'atasks.commands.service',
+                '-v', '4',
+                '-N', 'name=%s,mode=server,transport=amqp,url=%s' % (namespace, AMQP_URL),
+                *extra_args,
+                scenario_path,
+                cwd=REPO_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(os.environ, PYTHONUNBUFFERED='1', ATASKS_TEST_STARTED=started_path),
+            )
+
+            stderr_lines = []
+            ready = asyncio.Event()
+
+            async def read_stderr():
+                async for raw_line in proc.stderr:
+                    line = raw_line.decode(errors='replace')
+                    stderr_lines.append(line)
+                    if READY_PATTERN in line:
+                        ready.set()
+
+            stderr_reader = asyncio.create_task(read_stderr())
+            client_transport = None
+            call_task = None
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=15)
+
+                PickleCodec(namespace=namespace)
+                client_transport = AMQPTransport(namespace=namespace, url=AMQP_URL)
+                await client_transport.connect()
+
+                @atask(namespace=namespace, name='stuck_probe', timeout=20)
+                async def stuck_probe():
+                    raise AssertionError('The client-side RPC stub must not run locally')
+
+                call_task = asyncio.create_task(stuck_probe())
+                await asyncio.wait_for(RunAMQPShutdownTest._wait_for_file(started_path), timeout=10)
+
+                proc.send_signal(signal.SIGTERM)
+                await asyncio.wait_for(proc.wait(), timeout=10)
+                await asyncio.wait_for(stderr_reader, timeout=5)
+
+                with self.assertRaises(ServiceShuttingDown):
+                    await asyncio.wait_for(call_task, timeout=10)
+
+                return proc.returncode, ''.join(stderr_lines)
+            finally:
+                if call_task is not None and not call_task.done():
+                    call_task.cancel()
+                    try:
+                        await call_task
+                    except (asyncio.CancelledError, ServiceShuttingDown):
+                        pass
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                if client_transport is not None:
+                    await client_transport.disconnect()
+                if not stderr_reader.done():
+                    await asyncio.wait_for(stderr_reader, timeout=5)
+
+    async def test_001_timeout_cancels_handler_and_exits_zero(self):
+        returncode, stderr = await self._run_stuck_handler(['--shutdown-timeout', '1'])
+
+        self.assertEqual(returncode, 0, msg=stderr)
+        self.assertIn('Cancelling', stderr)
+        self.assertIn('service is shutting down', stderr)
+        for pattern in BAD_PATTERNS:
+            self.assertNotIn(pattern, stderr, pattern)
+
+    async def test_002_fail_on_timeout_exits_nonzero(self):
+        returncode, stderr = await self._run_stuck_handler(
+            ['--shutdown-timeout', '1', '--fail-on-shutdown-timeout'],
+        )
+
+        self.assertNotEqual(returncode, 0, msg=stderr)
+        self.assertIn('Shutdown timeout expired', stderr)
 
 
 class RunMultiNamespaceListeningTest(TestCase):

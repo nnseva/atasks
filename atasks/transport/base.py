@@ -11,6 +11,19 @@ from atasks.namespaces import namespaces
 logger = logging.getLogger(__name__)
 
 
+def watch_handler_task(task, what):
+    """
+    Log an exception raised inside a handler task returned by a callback
+    """
+    def _done(t):
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error('Unhandled error handling %s', what, exc_info=exc)
+    task.add_done_callback(_done)
+
+
 class RequestTimeoutError(TimeoutError):
     """
     Raised by the RPC (``@atask``) call path when no response is received
@@ -135,6 +148,8 @@ class Transport(object):
         :raises RequestTimeoutError: if no response arrives within ``timeout`` seconds
         :raises NoRouteError: if the request cannot be routed to any queue
         :raises ConnectionLostError: if the connection to the broker is lost while waiting
+        A receiving side that is shutting down does not answer with an error here:
+        the message is returned to the queue and another instance may serve it.
         """
         raise NotImplementedError()
 
@@ -172,15 +187,21 @@ class Transport(object):
 
     # -- Protected per-name registration methods --------------------------
     #
-    # The four pairs below are not meant to be called directly by library
+    # The three pairs below are not meant to be called directly by library
     # users - only ``Router.activate()``/``deactivate()`` calls them, once
     # per name known to it at activation time (see the ``Router`` docstrings
     # and the architecture plan for why registration after ``activate()`` is
     # no longer supported). They share one shape across all three atasks
     # patterns: register/unregister a single name's worth of subscription,
-    # given a callback that receives the raw message content (bytes). The
-    # request pair additionally expects the callback to *return* the encoded
-    # response - the other two are pure fire-and-forget and return nothing.
+    # given a callback that receives the raw message content (bytes).
+    #
+    # Callbacks return either an ``asyncio.Task`` that processes the message,
+    # or ``None`` to refuse it (e.g. the router is shutting down). The task
+    # is owned by the router: the transport must not cancel or await it on
+    # its own behalf. Request callbacks additionally receive a ``reply``
+    # coroutine function which the router awaits, inside its task, to publish
+    # the encoded response (bytes). A refused request is returned to the
+    # backend for redelivery where the backend supports it.
 
     async def _register_request_callback(self, name, callback):
         """
@@ -188,9 +209,12 @@ class Transport(object):
 
         :param name: name of the atask to receive requests for
         :type name: str
-        :param callback: coroutine called with the raw request content (bytes);
-                        must return the raw encoded response (bytes)
-        :type callback: awaitable(content: bytes) -> bytes
+        :param callback: called as ``callback(content, reply)`` with the raw request
+                        content (bytes) and an awaitable ``reply(response: bytes)``
+                        which publishes the encoded response to the caller. Returns
+                        an ``asyncio.Task`` processing the request, or ``None`` to
+                        refuse it.
+        :type callback: callable(content: bytes, reply) -> asyncio.Task or None
         """
         raise NotImplementedError()
 
@@ -215,9 +239,10 @@ class Transport(object):
 
         :param name: name of the queue/task to consume
         :type name: str
-        :param callback: coroutine called with the raw event content (bytes)
-                        for every delivered message
-        :type callback: awaitable(content: bytes)
+        :param callback: called with the raw event content (bytes) for every delivered
+                        message. Returns an ``asyncio.Task`` processing it, or ``None``
+                        to refuse it.
+        :type callback: callable(content: bytes) -> asyncio.Task or None
         """
         raise NotImplementedError()
 
@@ -242,9 +267,10 @@ class Transport(object):
 
         :param name: name of the broadcast topic to subscribe to
         :type name: str
-        :param callback: coroutine called with the raw event content (bytes)
-                        for every delivered message
-        :type callback: awaitable(content: bytes)
+        :param callback: called with the raw event content (bytes) for every delivered
+                        message. Returns an ``asyncio.Task`` processing it, or ``None``
+                        to refuse it.
+        :type callback: callable(content: bytes) -> asyncio.Task or None
         """
         raise NotImplementedError()
 
@@ -278,8 +304,10 @@ class LoopbackTransport(Transport):
     fails fast with :class:`UnknownRequestName` for a name with no registered
     callback, rather than imitating a real broker's silent
     "message unroutable, drop it" behaviour (which would mean hanging until
-    ``timeout`` or forever). Other ``Transport`` implementations are free to
-    behave differently in that situation.
+    ``timeout`` or forever). A callback refusing a request (returning ``None``)
+    raises :class:`NoRouteError`, since there is no other consumer to try.
+    Other ``Transport`` implementations are free to behave differently in
+    that situation.
     """
 
     def __init__(self, namespace='default'):
@@ -315,15 +343,27 @@ class LoopbackTransport(Transport):
         Overriden from the base class
 
         :raises UnknownRequestName: if no callback is currently registered for ``name``
+        :raises NoRouteError: if the registered callback refuses the request
         """
         logger.info('Sending a request %s using Loopback transport', name)
         callback = self._request_callbacks.get(name)
         if callback is None:
             raise UnknownRequestName(name)
+        response = asyncio.get_running_loop().create_future()
+
+        async def reply(data):
+            if not response.done():
+                response.set_result(data)
+
+        task = callback(content, reply)
+        if task is None:
+            raise NoRouteError(name)
+        watch_handler_task(task, f'request for {name}')
+        task.add_done_callback(lambda t: _fail_unanswered(t, response, name))
         try:
             if timeout is not None:
-                return await asyncio.wait_for(callback(content), timeout=timeout)
-            return await callback(content)
+                return await asyncio.wait_for(response, timeout=timeout)
+            return await response
         except asyncio.TimeoutError:
             logger.warning('Timed out waiting for a response to %s', name)
             raise RequestTimeoutError(name) from None
@@ -348,7 +388,12 @@ class LoopbackTransport(Transport):
         if callback is None:
             logger.warning('No competing consumer registered for event %s - dropping', name)
             return
-        await callback(content)
+        task = callback(content)
+        if task is None:
+            logger.warning('Competing consumer refused event %s - dropping', name)
+            return
+        watch_handler_task(task, f'queue event {name}')
+        await task
 
     async def _register_event_callback(self, name, callback):
         """
@@ -370,8 +415,16 @@ class LoopbackTransport(Transport):
         if not callbacks:
             logger.warning('No broadcast subscriber registered for %s - dropping', name)
             return
+        tasks = []
         for callback in callbacks:
-            await callback(content)
+            task = callback(content)
+            if task is None:
+                logger.warning('Broadcast subscriber refused %s', name)
+                continue
+            watch_handler_task(task, f'broadcast event {name}')
+            tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     async def _register_broadcast_callback(self, name, callback):
         """
@@ -387,6 +440,20 @@ class LoopbackTransport(Transport):
         if callbacks is None:
             return
         self._broadcast_callbacks[name] = []
+
+
+def _fail_unanswered(task, response, name):
+    """
+    Fail a pending loopback request if its handler task ended without replying
+    """
+    if response.done():
+        return
+    if task.cancelled():
+        response.set_exception(asyncio.CancelledError())
+    elif task.exception() is not None:
+        response.set_exception(task.exception())
+    else:
+        response.set_exception(NoRouteError(f'{name}: handler finished without a reply'))
 
 
 def get_transport(namespace='default'):

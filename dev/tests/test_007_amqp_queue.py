@@ -92,11 +92,17 @@ class AMQPQueueTest(TestCase):
         received_a = []
         received_b = []
 
-        async def _handle_a(content):
+        async def __handle_a_impl(content):
             received_a.append(content.decode())
 
-        async def _handle_b(content):
+        def _handle_a(content):
+            return asyncio.create_task(__handle_a_impl(content))
+
+        async def __handle_b_impl(content):
             received_b.append(content.decode())
+
+        def _handle_b(content):
+            return asyncio.create_task(__handle_b_impl(content))
 
         await worker_a._register_event_callback(name, _handle_a)
         await worker_b._register_event_callback(name, _handle_b)
@@ -134,9 +140,12 @@ class AMQPQueueTest(TestCase):
         received = []
         got_it = asyncio.Event()
 
-        async def _handle(content):
+        async def _handle_impl(content):
             received.append(content.decode())
             got_it.set()
+
+        def _handle(content):
+            return asyncio.create_task(_handle_impl(content))
 
         # The first registration will create a durable queue
         await worker._register_event_callback(name, _handle)
@@ -159,8 +168,11 @@ class AMQPQueueTest(TestCase):
         worker = await self._new_transport()
         received = []
 
-        async def _handle(content):
+        async def _handle_impl(content):
             received.append(content.decode())
+
+        def _handle(content):
+            return asyncio.create_task(_handle_impl(content))
 
         await worker._register_event_callback(name, _handle)
         await asyncio.sleep(0.3)

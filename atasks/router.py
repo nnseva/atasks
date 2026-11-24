@@ -2,6 +2,7 @@
 ATasks Router
 """
 
+import asyncio
 import logging
 import socket
 import sys
@@ -50,6 +51,37 @@ class LateRegistration(Exception):
     never the other way round.
     """
     pass
+
+
+class ServiceShuttingDown(Exception):
+    """
+    A remote call was cancelled because the service shut down before it finished.
+
+    Sent back to the caller in place of a result.
+    """
+    def __init__(self, name):
+        """Identify the cancelled remote call by name."""
+        super().__init__(name)
+        self.name = name
+
+
+class ResultNotSerializable(Exception):
+    """
+    The result of a remote call could not be encoded, so it was not sent.
+
+    Sent back to the caller in place of the unserializable result.
+    """
+    def __init__(self, name, result_type):
+        """Identify the remote call and the type that could not be serialized."""
+        super().__init__(name, result_type)
+        self.name = name
+        self.result_type = result_type
+
+    def __str__(self):
+        return f'{self.name}: result of type {self.result_type} cannot be serialized'
+
+
+CANCEL_GRACE_SECONDS = 2
 
 
 class Router(object):
@@ -120,6 +152,11 @@ class Router(object):
         self.namespace = namespace
         self.server = None
         self._activated = {'rpc': [], 'queue': [], 'broadcast': []}
+        # Accepting is switched off synchronously, as the first step of
+        # deactivate(), so no handler task can be created after it.
+        self._accepting = False
+        # Strong references to every handler task until it finishes.
+        self._active_tasks = set()
         self.hostname = hostname if hostname is not None else socket.gethostname()
         self.max_trace_depth = max_trace_depth
         self.trace_filter_modules = tuple(trace_filter_modules or ())
@@ -152,6 +189,7 @@ class Router(object):
         self.server = server
         if not self.server:
             return
+        self._accepting = True
 
         ns = namespaces.get(self.namespace)
         names = {
@@ -179,6 +217,7 @@ class Router(object):
         """
         logger.info('Deactivating %s', self.server)
         if not self.server:
+            self._accepting = False
             return
         for name in self._activated['rpc']:
             await self._deactivate_request(name)
@@ -187,37 +226,47 @@ class Router(object):
         for name in self._activated['broadcast']:
             await self._deactivate_broadcast(name)
         self._activated = {'rpc': [], 'queue': [], 'broadcast': []}
+        self._accepting = False
         self.server = None
 
     async def _activate_request(self, name):
         """Protected: subscribe the current server to RPC requests for one name."""
-        async def _callback(content):
-            return await self._on_request(name, content)
+        def _callback(content, reply):
+            return self._on_request(name, content, reply)
         await self.server._register_request_callback(name, _callback)
 
     async def _deactivate_request(self, name):
-        """Protected: undo :meth:`_activate_request` for one name."""
-        await self.server._unregister_request_callback(name)
+        """Protected: undo :meth:`_activate_request` for one name; failures are logged, not raised."""
+        try:
+            await self.server._unregister_request_callback(name)
+        except Exception:
+            logger.exception('Could not unregister request %s', name)
 
     async def _activate_queue(self, name):
         """Protected: subscribe the current server to a task-queue's events for one name."""
-        async def _callback(content):
-            await self._on_event(name, content)
+        def _callback(content):
+            return self._on_event(name, content)
         await self.server._register_event_callback(name, _callback)
 
     async def _deactivate_queue(self, name):
-        """Protected: undo :meth:`_activate_queue` for one name."""
-        await self.server._unregister_event_callback(name)
+        """Protected: undo :meth:`_activate_queue` for one name; failures are logged, not raised."""
+        try:
+            await self.server._unregister_event_callback(name)
+        except Exception:
+            logger.exception('Could not unregister event %s', name)
 
     async def _activate_broadcast(self, name):
         """Protected: subscribe the current server to a broadcast topic for one name."""
-        async def _callback(content):
-            await self._on_broadcast(name, content)
+        def _callback(content):
+            return self._on_broadcast(name, content)
         await self.server._register_broadcast_callback(name, _callback)
 
     async def _deactivate_broadcast(self, name):
-        """Protected: undo :meth:`_activate_broadcast` for one name."""
-        await self.server._unregister_broadcast_callback(name)
+        """Protected: undo :meth:`_activate_broadcast` for one name; failures are logged, not raised."""
+        try:
+            await self.server._unregister_broadcast_callback(name)
+        except Exception:
+            logger.exception('Could not unregister broadcast %s', name)
 
     async def send_request(self, name, *argv, timeout=None, trace_chain=(), **kwargs):
         """
@@ -320,115 +369,191 @@ class Router(object):
         content = await codec.encode((argv, kwargs, trace_chain))
         await client.publish_broadcast(name, content)
 
-    async def _on_request(self, name, content):
+    def _spawn(self, label, coro):
+        """
+        Protected: schedule a handler coroutine as a tracked task.
+
+        The router holds a strong reference to every task until it finishes,
+        so :meth:`wait_idle` and :meth:`cancel_active` can see all of them.
+        """
+        task = asyncio.get_running_loop().create_task(coro, name=label)
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
+        return task
+
+    def _on_request(self, name, content, reply):
         """
         Callback receiving a request.
 
-        Uses codec got from the namespace to decode the request content.
+        Synchronous on purpose: the acceptance check and the creation of the
+        handler task happen in one step, so a request either gets a task that
+        :meth:`wait_idle` will see, or is refused - there is no window in
+        between where a shutdown could miss it.
 
-        Awaits the job found in the registry.
-
-        Uses codec got from the namespace to encode the request response.
+        Name lookup errors (no codec, unknown name) are raised here, before a
+        task exists, and propagate to the transport as before.
 
         :param name: name of the request
         :type name: str
         :param content: content of the request
         :type content: bytes
-        :returns: encoded response
-        :rtype: bytes
+        :param reply: coroutine function delivering the encoded response back
+                      to the caller
+        :type reply: callable
+        :returns: task handling the request, or ``None`` if the router no
+                  longer accepts requests (the transport must then return the
+                  message to the queue)
+        :rtype: asyncio.Task or None
         """
+        if not self._accepting:
+            logger.info('Request %s refused: service is shutting down', name)
+            return None
         logger.info('Request received %s', name)
         codec = get_codec(self.namespace)
         if not codec:
             raise NoCodecRegistered()
-
-        argv, kwargs, trace_chain = await codec.decode(content)
         item = namespaces.get(self.namespace).rpc_registry.get(name)
         if not item:
             raise JobNotFound(name)
+        return self._spawn(f'request {self.namespace}.{name}', self._run_request(name, content, reply, codec, item))
 
-        coro = item.coro
-        options = item.options
+    async def _run_request(self, name, content, reply, codec, item):
+        """
+        Protected: the body of a request task - decode, call, encode, reply.
 
-        logger.debug('Request received %s with %s %s', name, argv, kwargs)
-        token = trace.enter(trace_chain)
+        RPC failures are routed back to the caller as-is (together with the
+        atask trace attached by _call_coro) and are never logged here - the
+        caller decides whether/how to log what it does with the exception.
+
+        If the task is cancelled (shutdown timeout), the caller still gets a
+        :class:`ServiceShuttingDown` answer instead of waiting for its timeout.
+        """
         try:
-            success, result = await self._call_coro(coro, argv, kwargs, options)
-        finally:
-            trace.leave(token)
-        # RPC failures are routed back to the caller as-is (together with the
-        # atask trace attached by _call_coro) and are never logged here - the
-        # caller decides whether/how to log what it does with the exception.
-        logger.debug('Request %s response returning success = %s: %s', name, success, result)
-        response = await codec.encode((success, result))
-        logger.info('Request %s response returning', name)
-        return response
+            argv, kwargs, trace_chain = await codec.decode(content)
+            logger.debug('Request received %s with %s %s', name, argv, kwargs)
+            token = trace.enter(trace_chain)
+            try:
+                success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+            finally:
+                trace.leave(token)
+            logger.debug('Request %s response returning success = %s: %s', name, success, result)
+            response = await codec.encode((success, result))
+            if response is None:
+                response = await codec.encode((False, ResultNotSerializable(name, type(result).__name__)))
+            await reply(response)
+            logger.info('Request %s response returning', name)
+        except asyncio.CancelledError:
+            try:
+                await reply(await codec.encode((False, ServiceShuttingDown(name))))
+            except Exception:
+                logger.exception('Could not report the cancellation of request %s', name)
+            raise
+        except Exception:
+            logger.exception('Request %s could not be processed', name)
 
-    async def _on_event(self, name, content):
+    def _on_event(self, name, content):
         """
         Callback receiving a competing-consumer task-queue event.
 
-        Unlike :meth:`_on_request`, no response is encoded or returned -
-        the underlying transport already knows not to expect one.
+        Like :meth:`_on_request`, but no response is sent back.
 
-        :param name: name of the request
+        :param name: name of the event
         :type name: str
-        :param content: content of the request
+        :param content: content of the event
         :type content: bytes
+        :returns: task handling the event, or ``None`` if refused
+        :rtype: asyncio.Task or None
         """
-        logger.info('Queue event received %s', name)
-        codec = get_codec(self.namespace)
-        if not codec:
-            raise NoCodecRegistered()
+        return self._dispatch_without_reply('Queue', namespaces.get(self.namespace).queue_registry, name, content)
 
-        argv, kwargs, trace_chain = await codec.decode(content)
-        item = namespaces.get(self.namespace).queue_registry.get(name)
-        if not item:
-            raise JobNotFound(name)
-
-        token = trace.enter(trace_chain)
-        try:
-            success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
-        finally:
-            trace.leave(token)
-        if not success:
-            # A queue task has no caller waiting for a response - the failure
-            # terminates here, so the full collected trace is logged in full,
-            # instead of just the exception's repr.
-            logger.error('Queue task %s raised an exception:\n%s', name, trace.format_trace(result))
-
-    async def _on_broadcast(self, name, content):
+    def _on_broadcast(self, name, content):
         """
         Callback receiving a fan-out broadcast event.
 
-        Unlike :meth:`_on_request`, no response is encoded or returned -
-        the underlying transport already knows not to expect one.
+        Like :meth:`_on_request`, but no response is sent back.
 
-        :param name: name of the request
+        :param name: name of the broadcast
         :type name: str
-        :param content: content of the request
+        :param content: content of the broadcast
         :type content: bytes
+        :returns: task handling the broadcast, or ``None`` if refused
+        :rtype: asyncio.Task or None
         """
-        logger.info('Broadcast event received %s', name)
+        return self._dispatch_without_reply('Broadcast', namespaces.get(self.namespace).broadcast_registry, name, content)
+
+    def _dispatch_without_reply(self, kind, registry, name, content):
+        """Protected: shared acceptance and task creation for events and broadcasts."""
+        if not self._accepting:
+            logger.info('%s event %s refused: service is shutting down', kind, name)
+            return None
+        logger.info('%s event received %s', kind, name)
         codec = get_codec(self.namespace)
         if not codec:
             raise NoCodecRegistered()
-
-        argv, kwargs, trace_chain = await codec.decode(content)
-        item = namespaces.get(self.namespace).broadcast_registry.get(name)
+        item = registry.get(name)
         if not item:
             raise JobNotFound(name)
+        return self._spawn(f'{kind.lower()} {self.namespace}.{name}', self._run_without_reply(kind, name, item, content, codec))
 
-        token = trace.enter(trace_chain)
+    async def _run_without_reply(self, kind, name, item, content, codec):
+        """
+        Protected: the body of an event/broadcast task - decode and call.
+
+        A failure terminates here, so the full collected trace is logged in
+        full, instead of just the exception's repr.
+        """
         try:
-            success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
-        finally:
-            trace.leave(token)
-        if not success:
-            # A broadcast task has no caller waiting for a response - the failure
-            # terminates here, so the full collected trace is logged in full,
-            # instead of just the exception's repr.
-            logger.error('Broadcast task %s raised an exception:\n%s', name, trace.format_trace(result))
+            argv, kwargs, trace_chain = await codec.decode(content)
+            token = trace.enter(trace_chain)
+            try:
+                success, result = await self._call_coro(item.coro, argv, kwargs, item.options)
+            finally:
+                trace.leave(token)
+            if not success:
+                logger.error('%s task %s raised an exception:\n%s', kind, name, trace.format_trace(result))
+        except Exception:
+            logger.exception('%s task %s could not be processed', kind, name)
+
+    async def wait_idle(self, timeout):
+        """
+        Wait until all accepted handler tasks finish, or the timeout expires.
+
+        Call only after :meth:`deactivate`, so that no new tasks can appear.
+
+        :param timeout: maximum number of seconds to wait
+        :type timeout: float
+        :returns: ``True`` if every active task finished, ``False`` on timeout
+        :rtype: bool
+        """
+        pending = set(self._active_tasks)
+        if not pending:
+            return True
+        logger.info('Waiting up to %s s for %d active task(s) of %s to finish', timeout, len(pending), self.namespace)
+        _, not_done = await asyncio.wait(pending, timeout=timeout)
+        return not not_done
+
+    async def cancel_active(self, grace=CANCEL_GRACE_SECONDS):
+        """
+        Cancel every handler task still active, and let the cancellations settle.
+
+        Each cancelled task reports :class:`ServiceShuttingDown` to its caller
+        before finishing. Call before the transport is disconnected, so that
+        those replies can still be published.
+
+        :param grace: maximum number of seconds to wait for the tasks to finish
+                      after cancelling them
+        :type grace: float
+        :returns: number of tasks that did not finish within ``grace``
+        :rtype: int
+        """
+        pending = set(self._active_tasks)
+        for task in pending:
+            logger.warning('Cancelling %s: service is shutting down', task.get_name())
+            task.cancel()
+        if not pending:
+            return 0
+        _, not_done = await asyncio.wait(pending, timeout=grace)
+        return len(not_done)
 
     async def _call_coro(self, coro, argv, kwargs, options):
         """

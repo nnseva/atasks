@@ -24,9 +24,10 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import time
 import uuid
-from unittest import IsolatedAsyncioTestCase as TestCase
+from unittest import IsolatedAsyncioTestCase as TestCase, skipUnless
 from urllib import request as urlrequest
 from urllib.error import URLError
 
@@ -239,15 +240,18 @@ class AMQPCoverageTest(TestCase):
 
         calls = {'n': 0}
 
-        async def handler(request):
+        async def _handler_impl(request, reply):
             calls['n'] += 1
             if calls['n'] == 1:
                 raise ValueError('boom')
-            return b'ok'
+            await reply(b'ok')
+
+        def handler(request, reply):
+            return asyncio.create_task(_handler_impl(request, reply))
 
         await server._register_request_callback('whatever', handler)
 
-        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+        with self.assertLogs('atasks.transport.base', level='ERROR') as logs:
             with self.assertRaises(RequestTimeoutError):
                 await client.send_request('whatever', b'1', timeout=2)
         self.assertTrue(any('Unhandled error handling request' in m for m in logs.output))
@@ -265,15 +269,18 @@ class AMQPCoverageTest(TestCase):
         received = []
         got_second = asyncio.Event()
 
-        async def handler(content):
+        async def _handler_impl(content):
             if content == b'first':
                 raise ValueError('boom')
             received.append(content)
             got_second.set()
 
+        def handler(content):
+            return asyncio.create_task(_handler_impl(content))
+
         await worker._register_event_callback(name, handler)
 
-        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+        with self.assertLogs('atasks.transport.base', level='ERROR') as logs:
             await publisher.publish_event(name, b'first')
             await publisher.publish_event(name, b'second')
             await asyncio.wait_for(got_second.wait(), timeout=5)
@@ -289,11 +296,14 @@ class AMQPCoverageTest(TestCase):
         received = []
         got_second = asyncio.Event()
 
-        async def handler(content):
+        async def _handler_impl(content):
             if content == b'first':
                 raise ValueError('boom')
             received.append(content)
             got_second.set()
+
+        def handler(content):
+            return asyncio.create_task(_handler_impl(content))
 
         await subscriber._register_broadcast_callback(name, handler)
         # give the exclusive queue's binding a moment to actually land before
@@ -301,7 +311,7 @@ class AMQPCoverageTest(TestCase):
         # "published before any subscriber" redelivery safety net here.
         await asyncio.sleep(0.3)
 
-        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+        with self.assertLogs('atasks.transport.base', level='ERROR') as logs:
             await publisher.publish_broadcast(name, b'first')
             await publisher.publish_broadcast(name, b'second')
             await asyncio.wait_for(got_second.wait(), timeout=5)
@@ -327,8 +337,11 @@ class AMQPCoverageTest(TestCase):
         server = await self._new_transport(queue=self.namespace)
         client = await self._new_transport()
 
-        async def handler(request):
-            return b'ok'
+        async def _handler_impl(request, reply):
+            await reply(b'ok')
+
+        def handler(request, reply):
+            return asyncio.create_task(_handler_impl(request, reply))
 
         await server._register_request_callback('whatever', handler)
 
@@ -361,9 +374,12 @@ class AMQPCoverageTest(TestCase):
 
         release = asyncio.Event()
 
-        async def slow_handler(request):
+        async def _slow_impl(request, reply):
             await release.wait()
-            return b'too-late'
+            await reply(b'too-late')
+
+        def slow_handler(request, reply):
+            return asyncio.create_task(_slow_impl(request, reply))
 
         await server._register_request_callback('whatever', slow_handler)
 
@@ -390,8 +406,11 @@ class AMQPCoverageTest(TestCase):
 
         received = []
 
-        async def handler(content):
+        async def _handler_impl(content):
             received.append(content)
+
+        def handler(content):
+            return asyncio.create_task(_handler_impl(content))
 
         await subscriber._register_broadcast_callback(name, handler)
         await asyncio.sleep(0.3)
@@ -476,3 +495,116 @@ class AMQPCoverageTest(TestCase):
                     break
                 await asyncio.sleep(0.3)
         self.assertTrue(any('Reconnected transport' in m for m in logs.output))
+
+    # -- a request refused during drain must be returned to the queue, not dropped --
+
+    async def test_017_refused_request_is_requeued_and_served_on_redelivery(self):
+        """A callback that refuses (returns None) must make the transport
+        reject the message with requeue=True: the broker redelivers it, and
+        the caller still gets a reply instead of a timeout."""
+        server = await self._new_transport(queue=self.namespace)
+        client = await self._new_transport()
+
+        calls = {'n': 0}
+
+        async def _handler_impl(request, reply):
+            await reply(b'ok')
+
+        def handler(request, reply):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return None
+            return asyncio.create_task(_handler_impl(request, reply))
+
+        await server._register_request_callback('whatever', handler)
+
+        result = await client.send_request('whatever', b'1', timeout=5)
+        self.assertEqual(result, b'ok')
+        self.assertEqual(calls['n'], 2)
+
+    # -- a callback that raises synchronously (before any task exists) --
+
+    async def test_018_request_callback_raising_is_logged_and_message_acked(self):
+        """A request callback raising before a task exists is logged and the
+        message is acknowledged: no redelivery loop, the caller just times out."""
+        server = await self._new_transport(queue=self.namespace)
+        client = await self._new_transport()
+
+        calls = {'n': 0}
+
+        def handler(request, reply):
+            calls['n'] += 1
+            raise RuntimeError('boom before task')
+
+        await server._register_request_callback('whatever', handler)
+
+        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+            with self.assertRaises(RequestTimeoutError):
+                await client.send_request('whatever', b'1', timeout=2)
+        self.assertTrue(any('Unhandled error handling request' in m for m in logs.output))
+        await asyncio.sleep(0.5)
+        self.assertEqual(calls['n'], 1)
+
+    async def test_019_event_callback_raising_is_logged_and_message_acked(self):
+        """An event callback raising synchronously is logged, and the next event is still delivered."""
+        name = 'coverage.event.sync_boom'
+        publisher = await self._new_transport()
+        worker = await self._new_transport()
+
+        seen = []
+        got_second = asyncio.Event()
+
+        def handler(content):
+            seen.append(content)
+            if content == b'first':
+                raise RuntimeError('boom before task')
+
+            async def _impl():
+                got_second.set()
+            return asyncio.create_task(_impl())
+
+        await worker._register_event_callback(name, handler)
+
+        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+            await publisher.publish_event(name, b'first')
+            await publisher.publish_event(name, b'second')
+            await asyncio.wait_for(got_second.wait(), timeout=5)
+        self.assertTrue(any('Unhandled error handling queue event' in m for m in logs.output))
+        self.assertEqual(seen, [b'first', b'second'])
+
+    async def test_020_broadcast_callback_raising_is_logged_and_message_acked(self):
+        """A broadcast callback raising synchronously is logged, and the next broadcast is still delivered."""
+        name = 'coverage.broadcast.sync_boom'
+        publisher = await self._new_transport()
+        subscriber = await self._new_transport()
+
+        seen = []
+        got_second = asyncio.Event()
+
+        def handler(content):
+            seen.append(content)
+            if content == b'first':
+                raise RuntimeError('boom before task')
+
+            async def _impl():
+                got_second.set()
+            return asyncio.create_task(_impl())
+
+        await subscriber._register_broadcast_callback(name, handler)
+        # same binding delay as test_008
+        await asyncio.sleep(0.3)
+
+        with self.assertLogs('atasks.transport.backends.amqp', level='ERROR') as logs:
+            await publisher.publish_broadcast(name, b'first')
+            await publisher.publish_broadcast(name, b'second')
+            await asyncio.wait_for(got_second.wait(), timeout=5)
+        self.assertTrue(any('Unhandled error handling broadcast event' in m for m in logs.output))
+        self.assertEqual(seen, [b'first', b'second'])
+
+
+class TaskCancellingFallbackTest(TestCase):
+    """The Python 3.10 branch of AMQPTransport._task_was_actually_cancelled (no Task.cancelling())."""
+
+    @skipUnless(sys.version_info < (3, 11), 'Python 3.10 only: Task.cancelling() exists from 3.11')
+    async def test_001_python_310_treats_every_cancelled_error_as_real(self):
+        self.assertTrue(AMQPTransport._task_was_actually_cancelled())
